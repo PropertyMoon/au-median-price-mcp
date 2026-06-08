@@ -80,8 +80,17 @@ async def _suburb_median(request: Request):
             {"error": "suburb and state query params are required"},
             status_code=400,
         )
-    result = await get_suburb_median(suburb, state)
-    return JSONResponse(result)
+    try:
+        result = await get_suburb_median(suburb, state)
+        return JSONResponse(result)
+    except Exception as e:
+        import traceback
+        print(f"  ❌ /suburb-median error for {suburb} {state}: {e}\n{traceback.format_exc()}")
+        return JSONResponse(
+            {"suburb": suburb, "state": state, "coverage": "no_data",
+             "message": f"Data load failed: {type(e).__name__}: {e}"},
+            status_code=200,  # return 200 so orchestrator handles it gracefully
+        )
 
 
 _mcp_app = mcp.streamable_http_app()

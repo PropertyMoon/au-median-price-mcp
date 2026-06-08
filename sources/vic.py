@@ -1,30 +1,31 @@
 """
-Victoria median house/unit prices — downloads the "Victorian Property Sales Report -
-Median House by Suburb Quarterly" Excel file from data.vic.gov.au (CKAN API discovery)
-and parses it into a suburb lookup.
+Victoria median house prices — quarterly XLS from the Valuer-General Victoria
+via discover.data.vic.gov.au (CKAN API).
 
-The XLS has one sheet per dwelling type (House, Unit) with columns:
-  Suburb | Municipality | Median | No. Transfers | Quarter | ...
+Package: "Victorian Property Sales Report - Median House by Suburb Quarterly"
+Package ID: 86b545d3-1d0b-4069-bce0-5ce813473759
+File format: .xls (old binary Excel — requires xlrd, NOT openpyxl)
 
-Data is cached in-process for 24 hours; first request triggers download (~1-3 MB).
+Typical sheet structure:
+  Title/header rows at top → first row containing "suburb" is the column header
+  Columns: Suburb | Municipality | Median | No. of Sales | Prior-period Median | Change %
+  Data for a single quarter (the period is encoded in the filename / title cell)
+
+Data is cached in-process for 24 hours; first request triggers download (~1 MB).
 """
 
 import asyncio
 import io
+import re
 import time
 
 import httpx
-import openpyxl
+import xlrd
 
-_CKAN_API  = "https://discover.data.vic.gov.au/api/3/action/package_show"
-_PACKAGE_IDS = [
-    "victorian-property-sales-report-median-house-by-suburb-quarterly",
-    # fallback slug variant
-    "property-sales-statistics-quarterly-median-sale-price-suburb",
-]
+_CKAN_API    = "https://discover.data.vic.gov.au/api/3/action/package_show"
+_PACKAGE_ID  = "86b545d3-1d0b-4069-bce0-5ce813473759"
 _FALLBACK_URL = (
-    "https://discover.data.vic.gov.au/dataset/"
-    "victorian-property-sales-report-median-house-by-suburb-quarterly"
+    "https://www.land.vic.gov.au/__data/assets/excel_doc/0023/762143/median-house-q2-2025.xls"
 )
 
 _cache: dict = {}
@@ -32,146 +33,117 @@ _cache_ts: float = 0.0
 _cache_lock = asyncio.Lock()
 
 
-async def _find_xlsx_url() -> str:
-    async with httpx.AsyncClient(timeout=15) as client:
-        for pkg_id in _PACKAGE_IDS:
-            try:
-                r = await client.get(_CKAN_API, params={"id": pkg_id})
-                if r.status_code != 200:
-                    continue
-                resources = r.json().get("result", {}).get("resources", [])
-                xlsx = [
-                    res for res in resources
-                    if (res.get("format") or "").upper() in ("XLSX", "XLS")
-                ]
-                if xlsx:
-                    xlsx.sort(key=lambda x: x.get("created", ""), reverse=True)
-                    return xlsx[0]["url"]
-            except Exception:
-                continue
+async def _find_xls_url() -> str:
+    """Discover the most recent XLS resource URL from the CKAN package."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(_CKAN_API, params={"id": _PACKAGE_ID})
+            r.raise_for_status()
+            resources = r.json().get("result", {}).get("resources", [])
+        xls = [
+            res for res in resources
+            if (res.get("format") or "").upper() in ("XLS", "XLSX")
+        ]
+        if xls:
+            xls.sort(key=lambda x: x.get("created", ""), reverse=True)
+            url = xls[0]["url"]
+            print(f"  📥 VIC median XLS: {url}")
+            return url
+    except Exception as e:
+        print(f"  ⚠️  VIC CKAN discovery failed ({e}), using fallback URL")
     return _FALLBACK_URL
 
 
-def _parse_quarter(val) -> str | None:
-    """Normalise quarter cell value to 'YYYY QN' string."""
-    if not val:
-        return None
-    s = str(val).strip()
-    # Already formatted: "2024 Q3", "Q3 2024"
-    import re
-    m = re.search(r"(\d{4})[\s\-/]?Q(\d)", s, re.I)
-    if m:
-        return f"{m.group(1)} Q{m.group(2)}"
-    m = re.search(r"Q(\d)[\s\-/]?(\d{4})", s, re.I)
+def _quarter_from_url(url: str) -> str | None:
+    """Try to extract quarter string from the filename, e.g. 'median-house-q2-2025.xls'."""
+    m = re.search(r'q(\d)-(\d{4})', url, re.I)
     if m:
         return f"{m.group(2)} Q{m.group(1)}"
-    return s
+    m = re.search(r'(\d{4}).*q(\d)', url, re.I)
+    if m:
+        return f"{m.group(1)} Q{m.group(2)}"
+    return None
 
 
-def _col_indices(headers: list) -> dict:
-    """Return a mapping of role → column index from a header row."""
-    result = {}
-    for i, h in enumerate(headers):
-        if h is None:
-            continue
-        h_low = str(h).strip().lower()
-        if "suburb" in h_low:
-            result.setdefault("suburb", i)
-        elif "median" in h_low and "price" not in h_low:
-            result.setdefault("median", i)
-        elif "median" in h_low and "price" in h_low:
-            result.setdefault("median", i)
-        elif "quarter" in h_low or "period" in h_low or "qtr" in h_low:
-            result.setdefault("quarter", i)
-        elif "transfer" in h_low or "sales" in h_low or "number" in h_low:
-            result.setdefault("transfers", i)
-    return result
+def _find_header_row(sheet) -> tuple[int, dict]:
+    """
+    Scan rows until we find one whose cells include 'suburb'.
+    Returns (row_index, col_map) where col_map maps role → col index.
+    """
+    for row_idx in range(min(20, sheet.nrows)):
+        row = [str(c or "").strip().lower() for c in sheet.row_values(row_idx)]
+        if any("suburb" in cell for cell in row):
+            col_map = {}
+            for i, h in enumerate(row):
+                if "suburb" in h and "suburb" not in col_map:
+                    col_map["suburb"] = i
+                elif "median" in h and "suburb" not in col_map:
+                    col_map.setdefault("median", i)
+                elif "median" in h:
+                    col_map.setdefault("median", i)
+                elif "sale" in h and "number" in h:
+                    col_map.setdefault("sales_count", i)
+                elif "number" in h or "no." in h or "count" in h:
+                    col_map.setdefault("sales_count", i)
+            return row_idx, col_map
+    return -1, {}
 
 
-async def _load() -> dict:
-    url = await _find_xlsx_url()
-    async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:
-        r = await client.get(url)
-        r.raise_for_status()
+def _parse_xls_bytes(raw: bytes, data_period: str) -> dict[str, dict]:
+    """Parse an XLS file and return suburb → {median_price, data_period}."""
+    wb = xlrd.open_workbook(file_contents=raw)
+    suburb_data: dict[str, dict] = {}
 
-    wb = openpyxl.load_workbook(io.BytesIO(r.content), read_only=True, data_only=True)
-
-    # suburb → {median_house_price, median_unit_price, price_history_quarterly, data_period}
-    house_data: dict[str, dict] = {}
-    unit_data:  dict[str, dict] = {}
-
-    for sheet_name in wb.sheetnames:
-        sn_low = sheet_name.strip().lower()
-        if "house" in sn_low:
-            target = house_data
-        elif "unit" in sn_low or "flat" in sn_low or "apt" in sn_low:
-            target = unit_data
-        else:
+    for sheet_name in wb.sheet_names():
+        sheet = wb.sheet_by_name(sheet_name)
+        header_row, col_map = _find_header_row(sheet)
+        if header_row < 0 or "suburb" not in col_map or "median" not in col_map:
             continue
 
-        ws = wb[sheet_name]
-        cols: dict = {}
-        latest_quarter = ""
+        sub_col = col_map["suburb"]
+        med_col = col_map["median"]
 
-        # suburb → list of (quarter_str, median_price)
-        suburb_history: dict[str, list] = {}
-
-        for row in ws.iter_rows(values_only=True):
-            if not any(row):
-                continue
-            # Detect header row
-            if not cols:
-                if any(
-                    cell is not None and "suburb" in str(cell).lower()
-                    for cell in row
-                ):
-                    cols = _col_indices(list(row))
+        for row_idx in range(header_row + 1, sheet.nrows):
+            row = sheet.row_values(row_idx)
+            if len(row) <= max(sub_col, med_col):
                 continue
 
-            if "suburb" not in cols or "median" not in cols:
+            suburb_raw = str(row[sub_col] or "").strip()
+            if not suburb_raw or suburb_raw.lower() in ("suburb", "total", "all suburbs", ""):
                 continue
 
-            suburb_raw = row[cols["suburb"]]
-            if not suburb_raw:
-                continue
-            suburb_key = str(suburb_raw).strip().upper()
-
-            median_raw = row[cols["median"]]
+            median_raw = row[med_col]
             try:
-                median = int(float(str(median_raw).replace(",", "").replace("$", "")))
-                if median <= 0:
+                # xlrd returns numbers as float
+                if isinstance(median_raw, (int, float)):
+                    median = int(median_raw)
+                else:
+                    median = int(str(median_raw).replace(",", "").replace("$", "").strip())
+                if median < 50_000 or median > 50_000_000:
                     continue
             except (ValueError, TypeError):
                 continue
 
-            quarter_str = None
-            if "quarter" in cols:
-                quarter_str = _parse_quarter(row[cols["quarter"]])
-            if not quarter_str:
-                quarter_str = "latest"
-
-            if quarter_str > latest_quarter:
-                latest_quarter = quarter_str
-
-            suburb_history.setdefault(suburb_key, []).append((quarter_str, median))
-
-        # Build per-suburb summary: latest median + last 8 quarters history
-        for suburb_key, history in suburb_history.items():
-            history.sort(key=lambda x: x[0], reverse=True)
-            latest_median = history[0][1] if history else None
-            hist_list = [
-                {"period": q, "median_price": p}
-                for q, p in history[:8]
-            ]
-            hist_list.reverse()  # oldest first
-            target[suburb_key] = {
-                "median_price":    latest_median,
-                "data_period":     history[0][0] if history else latest_quarter,
-                "price_history":   hist_list,
+            suburb_key = suburb_raw.upper()
+            suburb_data[suburb_key] = {
+                "median_price": median,
+                "data_period":  data_period,
             }
 
-    wb.close()
-    return {"house": house_data, "unit": unit_data}
+    return suburb_data
+
+
+async def _load() -> dict:
+    url = await _find_xls_url()
+    data_period = _quarter_from_url(url) or "latest"
+
+    async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+
+    house_data = _parse_xls_bytes(r.content, data_period)
+    print(f"  ✅ VIC median: {len(house_data)} suburbs loaded for {data_period}")
+    return {"house": house_data, "data_period": data_period}
 
 
 async def _data() -> dict:
@@ -187,33 +159,21 @@ async def _data() -> dict:
 async def get_vic_median(suburb: str) -> dict:
     suburb_upper = suburb.strip().upper()
     data = await _data()
-
     house = data["house"].get(suburb_upper)
-    unit  = data["unit"].get(suburb_upper)
 
-    if not house and not unit:
+    if not house:
         return {
             "suburb":   suburb,
             "state":    "VIC",
             "coverage": "no_data",
-            "message":  f"No median price records found for '{suburb}' in VIC dataset.",
+            "message":  f"No median price record for '{suburb}' in VIC dataset.",
         }
 
-    result: dict = {
-        "suburb":   suburb,
-        "state":    "VIC",
-        "coverage": "available",
-        "data_source": "Victorian Property Sales Report — Median House by Suburb Quarterly (data.vic.gov.au)",
+    return {
+        "suburb":              suburb,
+        "state":               "VIC",
+        "coverage":            "available",
+        "median_house_price":  house["median_price"],
+        "data_period":         house["data_period"],
+        "data_source":         "Victorian Property Sales Report — Median House by Suburb Quarterly (land.vic.gov.au / Valuer-General Victoria)",
     }
-
-    if house:
-        result["median_house_price"]          = house["median_price"]
-        result["data_period"]                  = house["data_period"]
-        result["price_history_quarterly"]      = house["price_history"]
-
-    if unit:
-        result["median_unit_price"] = unit["median_price"]
-        if "data_period" not in result:
-            result["data_period"] = unit["data_period"]
-
-    return result
