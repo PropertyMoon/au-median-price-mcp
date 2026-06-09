@@ -181,6 +181,7 @@ def _extract_record(parts: list[str]) -> dict | None:
             "price_raw": parts[15].strip(),
             "nature":    parts[17].strip().upper() if len(parts) > 17 else "",
             "purpose":   parts[18].strip().upper() if len(parts) > 18 else "",
+            "strata":    parts[19].strip()          if len(parts) > 19 else "",
             "unit_num":  parts[6].strip(),
             "street_num":parts[7].strip(),
             "street":    parts[8].strip(),
@@ -201,6 +202,7 @@ def _extract_record(parts: list[str]) -> dict | None:
             "price_raw": parts[13].strip(),
             "nature":    parts[15].strip().upper() if len(parts) > 15 else "",
             "purpose":   parts[16].strip().upper() if len(parts) > 16 else "",
+            "strata":    parts[17].strip()          if len(parts) > 17 else "",
             "unit_num":  parts[4].strip(),
             "street_num":parts[5].strip(),
             "street":    parts[6].strip(),
@@ -245,12 +247,14 @@ def _parse_dat_bytes(raw: bytes) -> tuple[dict, dict, dict]:
 
         nature  = rec["nature"]
         purpose = rec["purpose"]
+        strata  = rec.get("strata", "")
 
-        is_house = purpose in _HOUSE_PURPOSES or nature in _HOUSE_NATURES
-        is_unit  = purpose in _UNIT_PURPOSES
-        is_land  = nature in _VACANT_NATURES
+        is_strata = bool(strata)   # non-empty strata lot = villa/townhouse/apartment
+        is_house  = (purpose in _HOUSE_PURPOSES or nature in _HOUSE_NATURES) and not is_strata
+        is_unit   = purpose in _UNIT_PURPOSES or is_strata
+        is_land   = nature in _VACANT_NATURES
 
-        if is_house and not is_unit:
+        if is_house:
             house.setdefault(suburb_raw, []).append(price)
             prop_type = "house"
         elif is_unit:
