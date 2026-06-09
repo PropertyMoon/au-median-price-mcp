@@ -32,11 +32,20 @@ _cache: dict = {}
 _cache_ts: float = 0.0
 _cache_lock = asyncio.Lock()
 
+# land.vic.gov.au blocks requests without a browser-like User-Agent
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
+
 
 async def _find_xls_url() -> str:
     """Discover the most recent XLS resource URL from the CKAN package."""
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, headers=_HEADERS) as client:
             r = await client.get(_CKAN_API, params={"id": _PACKAGE_ID})
             r.raise_for_status()
             resources = r.json().get("result", {}).get("resources", [])
@@ -137,7 +146,7 @@ async def _load() -> dict:
     url = await _find_xls_url()
     data_period = _quarter_from_url(url) or "latest"
 
-    async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=90, follow_redirects=True, headers=_HEADERS) as client:
         r = await client.get(url)
         r.raise_for_status()
 
