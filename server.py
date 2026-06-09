@@ -73,25 +73,31 @@ async def get_comparable_sales(
     min_price: int = 0,
     max_price: int = 0,
     limit: int = 20,
+    address: str = "",
+    radius_km: float = 1.0,
 ) -> dict:
     """
-    Get recent comparable property sales in an Australian suburb.
+    Get recent comparable property sales near a property.
 
-    Returns individual property sales (address, price, date, type, land area)
-    from the most recent 24 months, sorted most-recent-first.
-    Useful for comparable market analysis (CMA).
+    When an address is supplied, returns sales within radius_km of that address
+    (geocoded via OSM Nominatim). Without an address, returns all sales in the suburb.
+    Results come from the most recent 24 months, sorted most-recent-first.
 
     Coverage:
     - NSW: NSW Valuer General bulk sales data (individual transactions, CC BY 4.0)
     - All other states: unavailable — use web search as fallback
 
     Args:
-        suburb:        Suburb name (e.g. "Paddington", "Newtown")
+        suburb:        Suburb name (e.g. "Paddington", "Castle Hill")
         state:         State abbreviation (e.g. "NSW")
+        address:       Full property address for radius search
+                       (e.g. "15 Smith Street Castle Hill NSW 2154").
+                       Leave blank to search the entire suburb.
+        radius_km:     Search radius in km when address is provided (default 1.0)
         property_type: Filter by type — "house", "unit", "land", "other", or "" for all
-        min_price:     Minimum sale price filter in AUD (0 = no minimum)
-        max_price:     Maximum sale price filter in AUD (0 = no maximum)
-        limit:         Maximum number of results to return (default 20, max 100)
+        min_price:     Minimum sale price in AUD (0 = no minimum)
+        max_price:     Maximum sale price in AUD (0 = no maximum)
+        limit:         Maximum results to return (default 20, max 100)
     """
     state_norm = state.strip().upper()
 
@@ -102,6 +108,8 @@ async def get_comparable_sales(
             min_price=min_price or None,
             max_price=max_price or None,
             limit=min(limit, 100),
+            address=address or None,
+            radius_km=radius_km,
         )
 
     return {
@@ -144,9 +152,11 @@ async def _comparable_sales(request: Request):
     suburb        = request.query_params.get("suburb",        "").strip()
     state         = request.query_params.get("state",         "").strip()
     property_type = request.query_params.get("property_type", "").strip()
-    limit         = int(request.query_params.get("limit",     "20") or "20")
-    min_price     = int(request.query_params.get("min_price", "0")  or "0")
-    max_price     = int(request.query_params.get("max_price", "0")  or "0")
+    limit         = int(request.query_params.get("limit",     "20")  or "20")
+    min_price     = int(request.query_params.get("min_price", "0")   or "0")
+    max_price     = int(request.query_params.get("max_price", "0")   or "0")
+    address       = request.query_params.get("address",       "").strip()
+    radius_km     = float(request.query_params.get("radius_km", "1.0") or "1.0")
 
     if not suburb or not state:
         return JSONResponse(
@@ -154,7 +164,7 @@ async def _comparable_sales(request: Request):
             status_code=400,
         )
     try:
-        result = await get_comparable_sales(suburb, state, property_type, min_price, max_price, limit)
+        result = await get_comparable_sales(suburb, state, property_type, min_price, max_price, limit, address, radius_km)
         return JSONResponse(result)
     except Exception as e:
         import traceback

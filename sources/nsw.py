@@ -2,40 +2,32 @@
 NSW property data — NSW Valuer General bulk property sales data.
 
 Source: https://valuation.property.nsw.gov.au/embed/propertySalesInformation
-Format: Yearly ZIPs (one per calendar year) + weekly ZIPs for the current year
-        Each ZIP contains .DAT files (one per LGA), semicolon-delimited
 Licence: Creative Commons Attribution 4.0 (CC BY 4.0)
 
-We parse the index page to discover:
-  - Yearly ZIPs for each year within the 24-month window
-  - Weekly ZIPs for the current year within the 24-month window
-All ZIPs are downloaded concurrently, then merged.
+Two DAT file formats exist:
+  YEARLY  (__psi/yearly/YYYY.zip)  — pipe-separated, one property per line
+    0:district  1:filetype  2:valnum  3:propID  4:unit  5:streetnum  6:street
+    7:suburb  8:postcode  9:area  10:areatype  11:contractdate  12:settlementdate
+    13:price  14:zone  15:nature  16:purpose  17:strata ...
 
-.DAT record format (semicolon-delimited, one record per property):
-  District code ; file type ; Valuation Num ; Property ID ; Unit ; Num ;
-  Street ; Suburb ; PostCode ; Area ; AreaType ; Contract Date ;
-  Settlement Date ; PurchasePrice ; ZoningCode ; NatureOfProperty ;
-  PrimaryPurpose ; Strata Lot ; Component Code ; SaleCode ; Interest % ;
-  Dealing Num
+  WEEKLY  (__psi/weekly/YYYYMMDD.zip)  — B-record format, record type in field 0
+    A = file header, B = sale record, C = title ref, D = party info
+    B record:
+    0:B  1:district  2:propID  3:seq  4:timestamp  5:unitprefix  6:unitnum
+    7:streetnum  8:street  9:suburb  10:postcode  11:area  12:areatype
+    13:contractdate  14:settlementdate  15:price  16:zone  17:nature  18:purpose ...
 
-Relevant fields (0-based):
-  4  = Unit number
-  5  = Street number
-  6  = Street name
-  7  = Suburb
-  8  = PostCode
-  9  = Area
-  10 = AreaType  (M=sqm, H=hectares)
-  11 = Contract Date  (YYYYMMDD)
-  13 = PurchasePrice
-  15 = NatureOfProperty  (V=Vacant Land, R=Residence, etc.)
-  16 = PrimaryPurpose    (RESIDENCE, UNIT, etc.)
+Comparable sales radius search:
+  - Uses pgeocode (offline AU postcode centroids, no API key)
+  - Optionally geocodes input address via OSM Nominatim (1 call per unique address)
+  - Filters sales to postcodes whose centroid is within radius_km of the input point
 
-Data cached in-process for 24 hours; first request triggers downloads.
+Data cached in-process for 24 hours.
 """
 
 import asyncio
 import io
+import math
 import re
 import statistics
 import time
@@ -44,34 +36,97 @@ from datetime import date, timedelta
 
 import httpx
 
-_INDEX_URL   = "https://valuation.property.nsw.gov.au/embed/propertySalesInformation"
-_BASE_URL    = "https://www.valuergeneral.nsw.gov.au"
+_INDEX_URL      = "https://valuation.property.nsw.gov.au/embed/propertySalesInformation"
+_BASE_URL       = "https://www.valuergeneral.nsw.gov.au"
+_NOMINATIM_URL  = "https://nominatim.openstreetmap.org/search"
+_NOMINATIM_UA   = "au-median-price-mcp/1.0 (property research)"
 
-_LOOKBACK_DAYS = 365 * 2   # 24 months of sales for median calculation
-_MIN_SALES     = 3          # minimum transactions to report a median
-_DL_CONCURRENCY = 5         # max simultaneous ZIP downloads
+_LOOKBACK_DAYS  = 365 * 2
+_MIN_SALES      = 3
+_DL_CONCURRENCY = 5
 
-_cache: dict = {}
-_cache_ts: float = 0.0
-_cache_lock = asyncio.Lock()
+_cache: dict        = {}
+_cache_ts: float    = 0.0
+_cache_lock         = asyncio.Lock()
+_geocode_cache: dict[str, tuple[float, float] | None] = {}
 
-_HOUSE_PURPOSES  = {"RESIDENCE", "RURAL RESIDENTIAL", "HOUSE"}
-_UNIT_PURPOSES   = {"UNIT", "FLAT", "APARTMENT", "STRATA UNIT"}
-_HOUSE_NATURES   = {"R", "3"}
-_VACANT_NATURES  = {"V"}
-_CUTOFF: date    = date.today() - timedelta(days=_LOOKBACK_DAYS)
+_HOUSE_PURPOSES = {"RESIDENCE", "RURAL RESIDENTIAL", "HOUSE"}
+_UNIT_PURPOSES  = {"UNIT", "FLAT", "APARTMENT", "STRATA UNIT"}
+_HOUSE_NATURES  = {"R", "3"}
+_VACANT_NATURES = {"V"}
+_CUTOFF: date   = date.today() - timedelta(days=_LOOKBACK_DAYS)
 
+# pgeocode for offline AU postcode centroids — optional, degrades gracefully
+try:
+    import pgeocode as _pgeocode
+    _PCODE_DB = _pgeocode.Nominatim("AU")
+    _PGEOCODE_OK = True
+except Exception:
+    _PCODE_DB    = None
+    _PGEOCODE_OK = False
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0
+    φ1, φ2 = math.radians(lat1), math.radians(lat2)
+    Δφ = math.radians(lat2 - lat1)
+    Δλ = math.radians(lon2 - lon1)
+    a = math.sin(Δφ / 2) ** 2 + math.cos(φ1) * math.cos(φ2) * math.sin(Δλ / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _postcode_centroid(postcode: str) -> tuple[float, float] | None:
+    if not _PGEOCODE_OK or _PCODE_DB is None:
+        return None
+    try:
+        row = _PCODE_DB.query_postal_code(postcode)
+        if row is not None and not math.isnan(float(row.latitude)):
+            return (float(row.latitude), float(row.longitude))
+    except Exception:
+        pass
+    return None
+
+
+async def _geocode_address(address: str) -> tuple[float, float] | None:
+    """Geocode a free-text address via OSM Nominatim. Results cached in-process."""
+    if address in _geocode_cache:
+        return _geocode_cache[address]
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                _NOMINATIM_URL,
+                params={"q": address, "format": "json", "limit": 1, "countrycodes": "au"},
+                headers={"User-Agent": _NOMINATIM_UA},
+            )
+            r.raise_for_status()
+            results = r.json()
+            if results:
+                coords = (float(results[0]["lat"]), float(results[0]["lon"]))
+                _geocode_cache[address] = coords
+                return coords
+    except Exception as e:
+        print(f"  ⚠️  Geocoding failed for '{address}': {e}")
+    _geocode_cache[address] = None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
 
 async def _discover_zip_urls() -> list[str]:
-    """Parse the index page and return ZIP URLs relevant to the 24-month window."""
+    cutoff_year  = _CUTOFF.year
+    current_year = date.today().year
+
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.get(_INDEX_URL)
         r.raise_for_status()
 
-    cutoff_year  = _CUTOFF.year
-    current_year = date.today().year
     urls = []
-
     for href in re.findall(r'href="([^"]+\.zip)"', r.text):
         if not href.startswith("http"):
             href = _BASE_URL + href
@@ -103,8 +158,56 @@ async def _fetch_zip(sem: asyncio.Semaphore, client: httpx.AsyncClient, url: str
         return r.content
 
 
+def _extract_record(parts: list[str]) -> dict | None:
+    """
+    Extract fields from one DAT line, handling both yearly and weekly B-record formats.
+    Returns None if the line should be skipped.
+    """
+    if not parts or not parts[0]:
+        return None
+
+    rec_type = parts[0].strip().upper()
+
+    if rec_type == "B":
+        # Weekly B-record format
+        if len(parts) < 19:
+            return None
+        return {
+            "suburb":    parts[9].strip().upper(),
+            "postcode":  parts[10].strip(),
+            "area":      parts[11].strip(),
+            "area_type": parts[12].strip().upper(),
+            "date_raw":  parts[13].strip(),
+            "price_raw": parts[15].strip(),
+            "nature":    parts[17].strip().upper() if len(parts) > 17 else "",
+            "purpose":   parts[18].strip().upper() if len(parts) > 18 else "",
+            "unit_num":  parts[6].strip(),
+            "street_num":parts[7].strip(),
+            "street":    parts[8].strip(),
+        }
+    elif rec_type in ("A", "C", "D", "E"):
+        # Weekly non-data records
+        return None
+    else:
+        # Yearly format — first field is district code (numeric)
+        if len(parts) < 17:
+            return None
+        return {
+            "suburb":    parts[7].strip().upper(),
+            "postcode":  parts[8].strip(),
+            "area":      parts[9].strip(),
+            "area_type": parts[10].strip().upper(),
+            "date_raw":  parts[11].strip(),
+            "price_raw": parts[13].strip(),
+            "nature":    parts[15].strip().upper() if len(parts) > 15 else "",
+            "purpose":   parts[16].strip().upper() if len(parts) > 16 else "",
+            "unit_num":  parts[4].strip(),
+            "street_num":parts[5].strip(),
+            "street":    parts[6].strip(),
+        }
+
+
 def _parse_dat_bytes(raw: bytes) -> tuple[dict, dict, dict]:
-    """Parse a single .DAT file; return (house_prices, unit_prices, sales_by_suburb)."""
     house: dict[str, list[int]] = {}
     unit:  dict[str, list[int]] = {}
     sales: dict[str, list[dict]] = {}
@@ -112,23 +215,20 @@ def _parse_dat_bytes(raw: bytes) -> tuple[dict, dict, dict]:
     text = raw.decode("latin-1", errors="replace")
     for line in text.splitlines():
         line = line.strip()
-        if not line or line.startswith(";"):
+        if not line:
             continue
         parts = line.split(";")
-        if len(parts) < 17:
+        rec = _extract_record(parts)
+        if rec is None:
             continue
 
-        suburb_raw = parts[7].strip().upper()
+        suburb_raw = rec["suburb"]
         if not suburb_raw:
             continue
 
-        contract_date_raw = parts[11].strip()
         try:
-            contract_date = date(
-                int(contract_date_raw[:4]),
-                int(contract_date_raw[4:6]),
-                int(contract_date_raw[6:8]),
-            )
+            d = rec["date_raw"]
+            contract_date = date(int(d[:4]), int(d[4:6]), int(d[6:8]))
         except (ValueError, IndexError):
             continue
 
@@ -136,17 +236,17 @@ def _parse_dat_bytes(raw: bytes) -> tuple[dict, dict, dict]:
             continue
 
         try:
-            price = int(str(parts[13]).strip().replace(",", "") or 0)
+            price = int(rec["price_raw"].replace(",", "") or 0)
         except (ValueError, TypeError):
             continue
 
         if price < 50_000 or price > 50_000_000:
             continue
 
-        nature  = parts[15].strip().upper() if len(parts) > 15 else ""
-        purpose = parts[16].strip().upper() if len(parts) > 16 else ""
+        nature  = rec["nature"]
+        purpose = rec["purpose"]
 
-        is_house = (purpose in _HOUSE_PURPOSES or nature in _HOUSE_NATURES)
+        is_house = purpose in _HOUSE_PURPOSES or nature in _HOUSE_NATURES
         is_unit  = purpose in _UNIT_PURPOSES
         is_land  = nature in _VACANT_NATURES
 
@@ -161,31 +261,28 @@ def _parse_dat_bytes(raw: bytes) -> tuple[dict, dict, dict]:
         else:
             prop_type = "other"
 
-        unit_num   = parts[4].strip()
-        street_num = parts[5].strip()
-        street     = parts[6].strip()
+        unit_num   = rec["unit_num"]
+        street_num = rec["street_num"]
+        street     = rec["street"]
         address    = f"{unit_num}/{street_num} {street}".strip() if unit_num else f"{street_num} {street}".strip()
 
-        postcode  = parts[8].strip() if len(parts) > 8 else ""
-        area_raw  = parts[9].strip() if len(parts) > 9 else ""
-        area_type = parts[10].strip().upper() if len(parts) > 10 else ""
-
-        record: dict = {
+        sale_rec: dict = {
             "address":       address,
-            "postcode":      postcode,
+            "suburb":        suburb_raw,
+            "postcode":      rec["postcode"],
             "sale_date":     contract_date.strftime("%Y-%m-%d"),
             "price":         price,
             "property_type": prop_type,
         }
 
         try:
-            area = float(area_raw) if area_raw else None
+            area = float(rec["area"]) if rec["area"] else None
             if area and area > 0:
-                record["land_area_sqm"] = int(area * 10000) if area_type == "H" else int(area)
+                sale_rec["land_area_sqm"] = int(area * 10000) if rec["area_type"] == "H" else int(area)
         except ValueError:
             pass
 
-        sales.setdefault(suburb_raw, []).append(record)
+        sales.setdefault(suburb_raw, []).append(sale_rec)
 
     return house, unit, sales
 
@@ -229,23 +326,39 @@ async def _load() -> dict:
         m = _median(prices)
         if m:
             house_medians[suburb] = m
-
     for suburb, prices in all_unit.items():
         m = _median(prices)
         if m:
             unit_medians[suburb] = m
 
+    # Sort by date desc and build postcode index
+    postcode_sales: dict[str, list[dict]] = {}
     for suburb in all_sales:
         all_sales[suburb].sort(key=lambda x: x["sale_date"], reverse=True)
+        for rec in all_sales[suburb]:
+            pc = rec.get("postcode", "")
+            if pc:
+                postcode_sales.setdefault(pc, []).append(rec)
+
+    # Pre-compute postcode centroids for fast radius queries
+    postcode_centroids: dict[str, tuple[float, float]] = {}
+    if _PGEOCODE_OK:
+        for pc in postcode_sales:
+            c = _postcode_centroid(pc)
+            if c:
+                postcode_centroids[pc] = c
 
     data_period = f"last 24 months to {date.today().strftime('%B %Y')}"
+    total_sales = sum(len(v) for v in all_sales.values())
     print(f"  ✅ NSW: {len(house_medians)} house suburbs, {len(unit_medians)} unit suburbs, "
-          f"{sum(len(v) for v in all_sales.values())} individual sales loaded")
+          f"{total_sales} individual sales, {len(postcode_centroids)} postcode centroids loaded")
     return {
-        "house":       house_medians,
-        "unit":        unit_medians,
-        "sales":       all_sales,
-        "data_period": data_period,
+        "house":               house_medians,
+        "unit":                unit_medians,
+        "sales":               all_sales,
+        "postcode_sales":      postcode_sales,
+        "postcode_centroids":  postcode_centroids,
+        "data_period":         data_period,
     }
 
 
@@ -258,6 +371,10 @@ async def _data() -> dict:
         _cache_ts = time.time()
         return _cache
 
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 async def get_nsw_median(suburb: str) -> dict:
     suburb_upper = suburb.strip().upper()
@@ -285,7 +402,6 @@ async def get_nsw_median(suburb: str) -> dict:
         result["median_house_price"] = house
     if unit:
         result["median_unit_price"] = unit
-
     return result
 
 
@@ -295,18 +411,39 @@ async def get_nsw_comparable_sales(
     min_price: int | None = None,
     max_price: int | None = None,
     limit: int = 20,
+    address: str | None = None,
+    radius_km: float = 1.0,
 ) -> dict:
-    suburb_upper = suburb.strip().upper()
     data = await _data()
 
-    records = data["sales"].get(suburb_upper, [])
+    if address:
+        coords = await _geocode_address(address)
+        if coords:
+            lat, lon = coords
+            centroids = data["postcode_centroids"]
+            near_postcodes = {
+                pc for pc, (plat, plon) in centroids.items()
+                if _haversine_km(lat, lon, plat, plon) <= radius_km
+            }
+            records: list[dict] = []
+            for pc in near_postcodes:
+                records.extend(data["postcode_sales"].get(pc, []))
+            records.sort(key=lambda x: x["sale_date"], reverse=True)
+            search_desc = f"{radius_km}km radius of '{address}'"
+        else:
+            # Geocoding failed — fall back to suburb
+            records = data["sales"].get(suburb.strip().upper(), [])
+            search_desc = f"suburb '{suburb}' (geocoding failed)"
+    else:
+        records = data["sales"].get(suburb.strip().upper(), [])
+        search_desc = f"suburb '{suburb}'"
 
     if not records:
         return {
             "suburb":   suburb,
             "state":    "NSW",
             "coverage": "no_data",
-            "message":  f"No sales records found for '{suburb}' in NSW dataset.",
+            "message":  f"No sales records found for {search_desc}.",
         }
 
     filtered = records
@@ -322,6 +459,7 @@ async def get_nsw_comparable_sales(
         "suburb":            suburb,
         "state":             "NSW",
         "coverage":          "available",
+        "search_area":       search_desc,
         "total_sales_found": len(filtered),
         "comparable_sales":  filtered[:limit],
         "data_period":       data["data_period"],
