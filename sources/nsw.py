@@ -2,13 +2,14 @@
 NSW property data — NSW Valuer General bulk property sales data.
 
 Source: https://valuation.property.nsw.gov.au/embed/propertySalesInformation
-Format: ZIP of .DAT files (one per LGA), semicolon-delimited
+Format: Yearly ZIPs (one per calendar year) + weekly ZIPs for the current year
+        Each ZIP contains .DAT files (one per LGA), semicolon-delimited
 Licence: Creative Commons Attribution 4.0 (CC BY 4.0)
 
-We download the full weekly ZIP (~50-100 MB), parse all .DAT files,
-filter to residential sales in the last 24 months, and compute:
-  - Suburb median house/unit prices
-  - Individual sale records for comparable sales lookups
+We parse the index page to discover:
+  - Yearly ZIPs for each year within the 24-month window
+  - Weekly ZIPs for the current year within the 24-month window
+All ZIPs are downloaded concurrently, then merged.
 
 .DAT record format (semicolon-delimited, one record per property):
   District code ; file type ; Valuation Num ; Property ID ; Unit ; Num ;
@@ -30,11 +31,12 @@ Relevant fields (0-based):
   15 = NatureOfProperty  (V=Vacant Land, R=Residence, etc.)
   16 = PrimaryPurpose    (RESIDENCE, UNIT, etc.)
 
-Data cached in-process for 24 hours; first request triggers ~50-100 MB download.
+Data cached in-process for 24 hours; first request triggers downloads.
 """
 
 import asyncio
 import io
+import re
 import statistics
 import time
 import zipfile
@@ -42,11 +44,12 @@ from datetime import date, timedelta
 
 import httpx
 
-_SALES_ZIP_URL = (
-    "https://valuation.property.nsw.gov.au/embed/propertySalesInformation"
-)
+_INDEX_URL   = "https://valuation.property.nsw.gov.au/embed/propertySalesInformation"
+_BASE_URL    = "https://www.valuergeneral.nsw.gov.au"
+
 _LOOKBACK_DAYS = 365 * 2   # 24 months of sales for median calculation
 _MIN_SALES     = 3          # minimum transactions to report a median
+_DL_CONCURRENCY = 5         # max simultaneous ZIP downloads
 
 _cache: dict = {}
 _cache_ts: float = 0.0
@@ -57,6 +60,47 @@ _UNIT_PURPOSES   = {"UNIT", "FLAT", "APARTMENT", "STRATA UNIT"}
 _HOUSE_NATURES   = {"R", "3"}
 _VACANT_NATURES  = {"V"}
 _CUTOFF: date    = date.today() - timedelta(days=_LOOKBACK_DAYS)
+
+
+async def _discover_zip_urls() -> list[str]:
+    """Parse the index page and return ZIP URLs relevant to the 24-month window."""
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        r = await client.get(_INDEX_URL)
+        r.raise_for_status()
+
+    cutoff_year  = _CUTOFF.year
+    current_year = date.today().year
+    urls = []
+
+    for href in re.findall(r'href="([^"]+\.zip)"', r.text):
+        if not href.startswith("http"):
+            href = _BASE_URL + href
+
+        yearly = re.search(r'/yearly/(\d{4})\.zip', href)
+        if yearly:
+            year = int(yearly.group(1))
+            if cutoff_year <= year < current_year:
+                urls.append(href)
+            continue
+
+        weekly = re.search(r'/weekly/(\d{4})(\d{2})(\d{2})\.zip', href)
+        if weekly:
+            try:
+                file_date = date(int(weekly.group(1)), int(weekly.group(2)), int(weekly.group(3)))
+                if file_date >= _CUTOFF:
+                    urls.append(href)
+            except ValueError:
+                pass
+
+    print(f"  📥 NSW: {len(urls)} ZIP files to download")
+    return urls
+
+
+async def _fetch_zip(sem: asyncio.Semaphore, client: httpx.AsyncClient, url: str) -> bytes:
+    async with sem:
+        r = await client.get(url)
+        r.raise_for_status()
+        return r.content
 
 
 def _parse_dat_bytes(raw: bytes) -> tuple[dict, dict, dict]:
@@ -117,14 +161,10 @@ def _parse_dat_bytes(raw: bytes) -> tuple[dict, dict, dict]:
         else:
             prop_type = "other"
 
-        # Build address
         unit_num   = parts[4].strip()
         street_num = parts[5].strip()
         street     = parts[6].strip()
-        if unit_num:
-            address = f"{unit_num}/{street_num} {street}".strip()
-        else:
-            address = f"{street_num} {street}".strip()
+        address    = f"{unit_num}/{street_num} {street}".strip() if unit_num else f"{street_num} {street}".strip()
 
         postcode  = parts[8].strip() if len(parts) > 8 else ""
         area_raw  = parts[9].strip() if len(parts) > 9 else ""
@@ -141,9 +181,7 @@ def _parse_dat_bytes(raw: bytes) -> tuple[dict, dict, dict]:
         try:
             area = float(area_raw) if area_raw else None
             if area and area > 0:
-                record["land_area_sqm"] = (
-                    int(area * 10000) if area_type == "H" else int(area)
-                )
+                record["land_area_sqm"] = int(area * 10000) if area_type == "H" else int(area)
         except ValueError:
             pass
 
@@ -159,25 +197,30 @@ def _median(prices: list[int]) -> int | None:
 
 
 async def _load() -> dict:
+    urls = await _discover_zip_urls()
+    if not urls:
+        raise RuntimeError("No NSW ZIP URLs discovered from index page")
+
+    sem = asyncio.Semaphore(_DL_CONCURRENCY)
     async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-        r = await client.get(_SALES_ZIP_URL)
-        r.raise_for_status()
+        zip_contents = await asyncio.gather(*[_fetch_zip(sem, client, u) for u in urls])
 
     all_house: dict[str, list[int]] = {}
     all_unit:  dict[str, list[int]] = {}
     all_sales: dict[str, list[dict]] = {}
 
-    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
-        dat_files = [n for n in zf.namelist() if n.upper().endswith(".DAT")]
-        for name in dat_files:
-            raw = zf.read(name)
-            h, u, s = _parse_dat_bytes(raw)
-            for suburb, prices in h.items():
-                all_house.setdefault(suburb, []).extend(prices)
-            for suburb, prices in u.items():
-                all_unit.setdefault(suburb, []).extend(prices)
-            for suburb, records in s.items():
-                all_sales.setdefault(suburb, []).extend(records)
+    for content in zip_contents:
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            for name in zf.namelist():
+                if not name.upper().endswith(".DAT"):
+                    continue
+                h, u, s = _parse_dat_bytes(zf.read(name))
+                for suburb, prices in h.items():
+                    all_house.setdefault(suburb, []).extend(prices)
+                for suburb, prices in u.items():
+                    all_unit.setdefault(suburb, []).extend(prices)
+                for suburb, records in s.items():
+                    all_sales.setdefault(suburb, []).extend(records)
 
     house_medians: dict[str, int] = {}
     unit_medians:  dict[str, int] = {}
@@ -192,7 +235,6 @@ async def _load() -> dict:
         if m:
             unit_medians[suburb] = m
 
-    # Sort each suburb's sales by date descending (most recent first)
     for suburb in all_sales:
         all_sales[suburb].sort(key=lambda x: x["sale_date"], reverse=True)
 
@@ -276,13 +318,11 @@ async def get_nsw_comparable_sales(
     if max_price:
         filtered = [r for r in filtered if r["price"] <= max_price]
 
-    total = len(filtered)
-
     return {
         "suburb":            suburb,
         "state":             "NSW",
         "coverage":          "available",
-        "total_sales_found": total,
+        "total_sales_found": len(filtered),
         "comparable_sales":  filtered[:limit],
         "data_period":       data["data_period"],
         "data_source":       "NSW Valuer General — Bulk Property Sales Data (CC BY 4.0)",
