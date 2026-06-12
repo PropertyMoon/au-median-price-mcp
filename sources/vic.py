@@ -15,7 +15,6 @@ Data is cached in-process for 24 hours; first request triggers download (~1 MB).
 """
 
 import asyncio
-import io
 import re
 import time
 
@@ -24,28 +23,40 @@ import xlrd
 
 _CKAN_API    = "https://discover.data.vic.gov.au/api/3/action/package_show"
 _PACKAGE_ID  = "86b545d3-1d0b-4069-bce0-5ce813473759"
-_FALLBACK_URL = (
-    "https://www.land.vic.gov.au/__data/assets/excel_doc/0023/762143/median-house-q2-2025.xls"
+_DATASET_PAGE = (
+    "https://discover.data.vic.gov.au/dataset/86b545d3-1d0b-4069-bce0-5ce813473759"
 )
+# Known base path on land.vic.gov.au — probe recent quarters in descending order
+_LAND_VIC_BASE = "https://www.land.vic.gov.au/__data/assets/excel_doc"
+_PROBE_QUARTERS = [
+    # (doc_id_fragment, filename) — add new quarters here as they're published
+    ("0023/762143", "median-house-q2-2025.xls"),  # confirmed working URL
+]
 
 _cache: dict = {}
 _cache_ts: float = 0.0
 _cache_lock = asyncio.Lock()
 
-# land.vic.gov.au blocks requests without a browser-like User-Agent
+# land.vic.gov.au blocks requests without browser-like headers
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "application/vnd.ms-excel,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-AU,en;q=0.9",
+    "Referer": _DATASET_PAGE,
 }
 
 
-async def _find_xls_url() -> str:
-    """Discover the most recent XLS resource URL from the CKAN package."""
+async def _ckan_candidates() -> list[str]:
+    """Return XLS resource URLs from CKAN, newest first. Empty list on any error."""
     try:
-        async with httpx.AsyncClient(timeout=15, headers=_HEADERS) as client:
+        async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(_CKAN_API, params={"id": _PACKAGE_ID})
             r.raise_for_status()
             resources = r.json().get("result", {}).get("resources", [])
@@ -53,14 +64,15 @@ async def _find_xls_url() -> str:
             res for res in resources
             if (res.get("format") or "").upper() in ("XLS", "XLSX")
         ]
-        if xls:
-            xls.sort(key=lambda x: x.get("created", ""), reverse=True)
-            url = xls[0]["url"]
-            print(f"  📥 VIC median XLS: {url}")
-            return url
+        xls.sort(key=lambda x: x.get("created", ""), reverse=True)
+        urls = [res["url"] for res in xls if res.get("url")]
+        if urls:
+            print(f"  📥 VIC CKAN candidates: {urls}")
+        return urls
     except Exception as e:
-        print(f"  ⚠️  VIC CKAN discovery failed ({e}), using fallback URL")
-    return _FALLBACK_URL
+        print(f"  ⚠️  VIC CKAN discovery failed ({e})")
+        return []
+
 
 
 def _quarter_from_url(url: str) -> str | None:
@@ -143,16 +155,33 @@ def _parse_xls_bytes(raw: bytes, data_period: str) -> dict[str, dict]:
 
 
 async def _load() -> dict:
-    url = await _find_xls_url()
-    data_period = _quarter_from_url(url) or "latest"
+    # Build ordered list of URLs to try: CKAN-discovered first, then hardcoded fallbacks.
+    candidates = await _ckan_candidates()
+    hardcoded = [
+        f"{_LAND_VIC_BASE}/{frag}/{fname}"
+        for frag, fname in _PROBE_QUARTERS
+    ]
+    urls_to_try = list(dict.fromkeys(candidates + hardcoded))  # deduplicate, preserve order
 
+    last_err: Exception = RuntimeError("No VIC median URLs to try")
     async with httpx.AsyncClient(timeout=90, follow_redirects=True, headers=_HEADERS) as client:
-        r = await client.get(url)
-        r.raise_for_status()
+        for url in urls_to_try:
+            try:
+                print(f"  📥 VIC median attempting: {url}")
+                r = await client.get(url)
+                r.raise_for_status()
+                data_period = _quarter_from_url(url) or "latest"
+                house_data = _parse_xls_bytes(r.content, data_period)
+                print(f"  ✅ VIC median: {len(house_data)} suburbs loaded for {data_period}")
+                return {"house": house_data, "data_period": data_period}
+            except httpx.HTTPStatusError as e:
+                print(f"  ⚠️  VIC download {url} → HTTP {e.response.status_code}, trying next")
+                last_err = e
+            except Exception as e:
+                print(f"  ⚠️  VIC download {url} → {e}, trying next")
+                last_err = e
 
-    house_data = _parse_xls_bytes(r.content, data_period)
-    print(f"  ✅ VIC median: {len(house_data)} suburbs loaded for {data_period}")
-    return {"house": house_data, "data_period": data_period}
+    raise last_err
 
 
 async def _data() -> dict:
