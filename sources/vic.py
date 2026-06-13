@@ -53,8 +53,15 @@ _HEADERS = {
 }
 
 
+_CKAN_PORTAL = "https://discover.data.vic.gov.au"
+
 async def _ckan_candidates() -> list[str]:
-    """Return XLS resource URLs from CKAN, newest first. Empty list on any error."""
+    """Return XLS download URLs from CKAN, newest first.
+
+    Yields CKAN portal proxy URLs first (routed via discover.data.vic.gov.au,
+    bypassing the land.vic.gov.au WAF), then the direct land.vic.gov.au URLs
+    as a fallback. Excludes web.archive.org links which return HTML wrappers.
+    """
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(_CKAN_API, params={"id": _PACKAGE_ID})
@@ -66,9 +73,17 @@ async def _ckan_candidates() -> list[str]:
             and "web.archive.org" not in (res.get("url") or "")
         ]
         xls.sort(key=lambda x: x.get("created", ""), reverse=True)
-        urls = [res["url"] for res in xls if res.get("url")]
+
+        # Build CKAN portal proxy URLs first — these route through
+        # discover.data.vic.gov.au and avoid the land.vic.gov.au WAF.
+        proxy_urls = [
+            f"{_CKAN_PORTAL}/dataset/{_PACKAGE_ID}/resource/{res['id']}/download"
+            for res in xls if res.get("id")
+        ]
+        direct_urls = [res["url"] for res in xls if res.get("url")]
+        urls = list(dict.fromkeys(proxy_urls + direct_urls))
         if urls:
-            print(f"  📥 VIC CKAN candidates: {urls}")
+            print(f"  📥 VIC CKAN candidates ({len(proxy_urls)} proxy, {len(direct_urls)} direct): {urls}")
         return urls
     except Exception as e:
         print(f"  ⚠️  VIC CKAN discovery failed ({e})")
