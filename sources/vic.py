@@ -63,6 +63,7 @@ async def _ckan_candidates() -> list[str]:
         xls = [
             res for res in resources
             if (res.get("format") or "").upper() in ("XLS", "XLSX")
+            and "web.archive.org" not in (res.get("url") or "")
         ]
         xls.sort(key=lambda x: x.get("created", ""), reverse=True)
         urls = [res["url"] for res in xls if res.get("url")]
