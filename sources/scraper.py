@@ -53,7 +53,8 @@ async def _fetch(url: str) -> str | None:
         print(f"  Scrapfly status {sc}: {url[:80]}")
         return None
     except Exception as e:
-        print(f"  Scrapfly error ({e}): {url[:80]}")
+        err_msg = str(e).replace(_SCRAPFLY_KEY, "scp-***") if _SCRAPFLY_KEY else str(e)
+        print(f"  Scrapfly error ({err_msg}): {url[:80]}")
         return None
 
 
@@ -411,3 +412,143 @@ async def get_scraper_comparable_sales(
         "data_period":       f"July {prv_yr} – present",
         "data_source":       "realestate.com.au + domain.com.au (via Scrapfly)",
     }
+
+
+# ---------------------------------------------------------------------------
+# Debug helper — exposes parse internals without filtering
+# ---------------------------------------------------------------------------
+
+async def debug_scraper_comparable_sales(suburb: str, state: str, postcode: str) -> dict:
+    """
+    Diagnostic endpoint: fetch REA + Domain and return raw parse details.
+    Use /debug-comparable-sales to diagnose parser failures on Railway.
+    """
+    suburb_rea    = suburb.lower().replace(" ", "+")
+    suburb_domain = suburb.lower().replace(" ", "-")
+    state_lower   = state.lower()
+    prv_yr        = datetime.datetime.now().year - 1
+    domain_min    = f"{prv_yr}-07-01"
+
+    rea_url = (
+        f"https://www.realestate.com.au/sold/in-{suburb_rea}+"
+        f"{state_lower}+{postcode}/list-1"
+        f"?includeSurrounding=false&source=refinement&soldIn=12"
+    )
+    domain_url = (
+        f"https://www.domain.com.au/sold-listings/{suburb_domain}-{state_lower}-{postcode}/"
+        f"?excludepricewithheld=1&ssubs=0&dateRange[min]={domain_min}"
+    )
+
+    rea_html, domain_html = await asyncio.gather(_fetch(rea_url), _fetch(domain_url))
+
+    out: dict = {"rea_url": rea_url, "domain_url": domain_url}
+
+    # ---- REA diagnostics ----
+    rea: dict = {"fetched": rea_html is not None, "html_size": len(rea_html) if rea_html else 0}
+    if rea_html:
+        m = re.search(r"window\.ArgonautExchange\s*=\s*(\{.+?\});\s*(?:window\.|</script>)", rea_html, re.DOTALL)
+        if not m:
+            m = re.search(r"window\.ArgonautExchange\s*=\s*(\{.+)", rea_html)
+        rea["argonaut_found"] = bool(m)
+        if m:
+            raw_json = m.group(1)
+            data = None
+            for candidate in (raw_json, raw_json.rsplit("};", 1)[0] + "}"):
+                try:
+                    data = json.loads(candidate)
+                    break
+                except json.JSONDecodeError:
+                    pass
+            rea["argonaut_parseable"] = data is not None
+            if data:
+                rea["argonaut_top_keys"] = list(data.keys())[:12]
+                rea["argonaut_second_level"] = {
+                    k: (list(v.keys())[:8] if isinstance(v, dict) else type(v).__name__)
+                    for k, v in list(data.items())[:6]
+                }
+                # Try known paths first
+                listings_raw: list | None = None
+                found_path: str | None = None
+                for key, value in data.items():
+                    if not isinstance(value, dict):
+                        continue
+                    d = value.get("data", {})
+                    if isinstance(d, dict):
+                        for subkey in ("results", "listings", "data", "listingResponseData",
+                                       "propertySaleActivityResults", "soldResults"):
+                            c = d.get(subkey)
+                            if isinstance(c, list) and c:
+                                listings_raw = c
+                                found_path = f"{key}.data.{subkey}"
+                                break
+                    if listings_raw:
+                        break
+                if not listings_raw:
+                    listings_raw = _find_listings_recursive(data)
+                    found_path = "recursive" if listings_raw else None
+
+                rea["listings_path"] = found_path
+                if listings_raw:
+                    rea["raw_count"] = len(listings_raw)
+                    rea["sample_item_keys"] = list(listings_raw[0].keys())
+                    rea["sample_item_snippet"] = dict(list(listings_raw[0].items())[:6])
+                else:
+                    rea["raw_count"] = 0
+
+        extracted_rea = _parse_rea(rea_html)
+        rea["extracted_count"] = len(extracted_rea)
+        rea["sample_extracted"] = extracted_rea[:2]
+    out["rea"] = rea
+
+    # ---- Domain diagnostics ----
+    dom: dict = {"fetched": domain_html is not None, "html_size": len(domain_html) if domain_html else 0}
+    if domain_html:
+        pat = r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>'
+        m2 = re.search(pat, domain_html, re.DOTALL)
+        dom["next_data_found"] = bool(m2)
+        if m2:
+            try:
+                nd = json.loads(m2.group(1))
+                page_props = nd.get("props", {}).get("pageProps", {})
+                dom["page_props_keys"] = list(page_props.keys())[:15]
+                comp_props = page_props.get("componentProps", {})
+                if isinstance(comp_props, dict):
+                    dom["component_props_keys"] = list(comp_props.keys())[:15]
+
+                matched_path: str | None = None
+                listings_map = None
+                for path in [
+                    ["componentProps", "listingsMap"],
+                    ["componentProps", "listings"],
+                    ["listingsMap"],
+                    ["listings"],
+                    ["searchResults", "listings"],
+                    ["searchResults", "results"],
+                ]:
+                    node = page_props
+                    for key in path:
+                        node = node.get(key, {}) if isinstance(node, dict) else {}
+                    if node:
+                        listings_map = node
+                        matched_path = ".".join(path)
+                        break
+
+                dom["listings_path"] = matched_path or "not_found"
+                if listings_map:
+                    items = list(listings_map.values()) if isinstance(listings_map, dict) else list(listings_map)
+                    dom["raw_count"] = len(items)
+                    if items:
+                        dom["sample_item_keys"] = list(items[0].keys())[:15]
+                        dom["sample_item_snippet"] = dict(list(items[0].items())[:6])
+                else:
+                    dom["raw_count"] = 0
+            except json.JSONDecodeError as e:
+                dom["next_data_parseable"] = False
+                dom["parse_error"] = str(e)[:200]
+
+        extracted_dom = _parse_domain(domain_html)
+        dom["extracted_count"] = len(extracted_dom)
+        dom["sample_extracted"] = extracted_dom[:2]
+    out["domain"] = dom
+
+    return out
