@@ -104,6 +104,18 @@ def _year_from_date(date_str: str | None) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _date_from_tag_text(tag_text: str | None) -> str | None:
+    """Extract sale date from Domain tag like 'Sold by private treaty 14 May 2026'."""
+    if not tag_text:
+        return None
+    m = re.search(
+        r'\b(\d{1,2})\s+(January|February|March|April|May|June|'
+        r'July|August|September|October|November|December)\s+(\d{4})\b',
+        tag_text,
+    )
+    return f"{m.group(2)} {m.group(3)}" if m else None
+
+
 # ---------------------------------------------------------------------------
 # REA parser — data lives in window.ArgonautExchange
 # ---------------------------------------------------------------------------
@@ -269,12 +281,18 @@ def _parse_domain(html: str) -> list[dict]:
     items = listings_map.values() if isinstance(listings_map, dict) else listings_map
     for item in items:
         try:
-            addr = item.get("address") or {}
+            # Domain now wraps all listing data inside "listingModel"; fall back to item itself
+            # for older structures that stored fields directly on the item.
+            lm = item.get("listingModel") or item
+
+            addr = lm.get("address") or item.get("address") or {}
             address_str = (
                 addr.get("fullAddress") or
                 (addr.get("display") or {}).get("fullAddress") or ""
             )
             if not address_str:
+                # New structure: addr["street"] already includes the street number.
+                # Old structure: addr["streetNumber"] + addr["street"] are separate.
                 parts = [
                     str(addr.get("streetNumber") or ""),
                     str(addr.get("street") or ""),
@@ -286,28 +304,35 @@ def _parse_domain(html: str) -> list[dict]:
             if not address_str.strip():
                 continue
 
-            price_detail = item.get("price") or item.get("soldDetails") or {}
-            price = _parse_price(
-                price_detail.get("displayPrice") or
-                price_detail.get("value") or
-                item.get("soldPrice")
-            )
+            # Price: new structure stores a display string at lm["price"] (e.g. "$1,222,500").
+            # Old structure stores a dict with displayPrice/value.
+            price_raw = lm.get("price") or lm.get("soldDetails") or item.get("soldPrice")
+            if isinstance(price_raw, dict):
+                price_raw = price_raw.get("displayPrice") or price_raw.get("value")
+            price = _parse_price(price_raw)
 
+            # Date: new structure stores "Sold by private treaty 14 May 2026" in
+            # lm["tags"]["tagText"]. Old structure had an ISO date in soldDate/dateSold.
+            tag_text = (lm.get("tags") or {}).get("tagText", "")
             date_str = _parse_date(
-                item.get("soldDate") or
-                item.get("dateSold") or
-                (item.get("soldDetails") or {}).get("soldDate")
-            )
+                lm.get("soldDate") or
+                lm.get("dateSold") or
+                (lm.get("soldDetails") or {}).get("soldDate") or
+                item.get("soldDate")
+            ) or _date_from_tag_text(tag_text)
 
-            features = item.get("features") or item.get("propertyFeatures") or {}
-            land_raw = features.get("landArea") or item.get("landArea")
+            features = lm.get("features") or item.get("features") or item.get("propertyFeatures") or {}
+            land_raw = (
+                features.get("landSize") or features.get("landArea") or
+                lm.get("landArea") or item.get("landArea")
+            )
 
             results.append({
                 "address":    address_str.strip(),
                 "sale_price": price,
                 "sale_date":  date_str,
-                "bedrooms":   features.get("bedrooms") or item.get("bedrooms"),
-                "bathrooms":  features.get("bathrooms") or item.get("bathrooms"),
+                "bedrooms":   features.get("beds") or features.get("bedrooms") or item.get("bedrooms"),
+                "bathrooms":  features.get("baths") or features.get("bathrooms") or item.get("bathrooms"),
                 "land_sqm":   int(land_raw) if land_raw else None,
                 "source":     "domain",
             })
@@ -494,6 +519,24 @@ async def debug_scraper_comparable_sales(suburb: str, state: str, postcode: str)
                     rea["sample_item_snippet"] = dict(list(listings_raw[0].items())[:6])
                 else:
                     rea["raw_count"] = 0
+                    # Expose urql cache keys so we can understand REA's new structure
+                    urql_key = next(iter(data.keys()), None)
+                    if urql_key:
+                        urql_cache = data[urql_key].get("urqlClientCache", {})
+                        if isinstance(urql_cache, dict):
+                            cache_keys = list(urql_cache.keys())[:20]
+                            rea["urql_cache_key_count"] = len(urql_cache)
+                            rea["urql_cache_sample_keys"] = cache_keys
+                            # Show first non-trivial value
+                            for ck in cache_keys:
+                                cv = urql_cache[ck]
+                                if isinstance(cv, dict) and len(cv) > 2:
+                                    rea["urql_cache_sample_entity"] = {
+                                        "key": ck,
+                                        "value_keys": list(cv.keys())[:12],
+                                        "snippet": dict(list(cv.items())[:4]),
+                                    }
+                                    break
 
         extracted_rea = _parse_rea(rea_html)
         rea["extracted_count"] = len(extracted_rea)
