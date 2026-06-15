@@ -2,16 +2,19 @@
 au-median-price-mcp — MCP server providing Australian suburb median property prices
 and comparable sales data.
 
-Coverage:
+Median price coverage:
   VIC: Victorian Property Sales Report quarterly XLS (data.vic.gov.au)
   NSW: NSW Valuer General bulk sales .DAT files (weekly, CC BY 4.0)
-       Comparable sales: individual transactions with address, price, date, type
-  All other states: coverage=unavailable — caller should fall back to web search
+  All other states: unavailable — caller falls back to web search
+
+Comparable sales coverage:
+  NSW: NSW Valuer General (authoritative, supports radius/type/price filters)
+  All other states: REA + Domain via Scrapfly (last 12 months, requires postcode)
 
 Transport: streamable-http (Railway deployment + Anthropic API integration)
 Health:    GET /health
 REST:      GET /suburb-median?suburb=X&state=Y
-           GET /comparable-sales?suburb=X&state=Y[&property_type=house&min_price=500000&max_price=1000000&limit=20]
+           GET /comparable-sales?suburb=X&state=Y&postcode=Z[&street=S&limit=20]
 MCP:       POST /mcp
 """
 
@@ -25,6 +28,7 @@ from starlette.routing import Mount, Route
 
 from sources.vic import get_vic_median
 from sources.nsw import get_nsw_median, get_nsw_comparable_sales
+from sources.scraper import get_scraper_comparable_sales
 
 mcp = FastMCP("au-median-price", stateless_http=True)
 
@@ -69,6 +73,8 @@ async def get_suburb_median(suburb: str, state: str) -> dict:
 async def get_comparable_sales(
     suburb: str,
     state: str,
+    postcode: str = "",
+    street: str = "",
     property_type: str = "",
     min_price: int = 0,
     max_price: int = 0,
@@ -79,25 +85,25 @@ async def get_comparable_sales(
     """
     Get recent comparable property sales near a property.
 
-    When an address is supplied, returns sales within radius_km of that address
-    (geocoded via OSM Nominatim). Without an address, returns all sales in the suburb.
-    Results come from the most recent 24 months, sorted most-recent-first.
-
     Coverage:
-    - NSW: NSW Valuer General bulk sales data (individual transactions, CC BY 4.0)
-    - All other states: unavailable — use web search as fallback
+    - NSW: NSW Valuer General bulk sales data (authoritative, CC BY 4.0).
+           Supports radius search, property type filter, price range.
+    - All other states (VIC, SA, QLD, WA, TAS, NT, ACT): REA + Domain via Scrapfly.
+           Returns last 12 months. Requires postcode. street triggers same-street results first.
+           Falls back to "unavailable" if SCRAPFLY_API_KEY is not set.
 
     Args:
-        suburb:        Suburb name (e.g. "Paddington", "Castle Hill")
-        state:         State abbreviation (e.g. "NSW")
-        address:       Full property address for radius search
-                       (e.g. "15 Smith Street Castle Hill NSW 2154").
-                       Leave blank to search the entire suburb.
-        radius_km:     Search radius in km when address is provided (default 1.0)
-        property_type: Filter by type — "house", "unit", "land", "other", or "" for all
-        min_price:     Minimum sale price in AUD (0 = no minimum)
-        max_price:     Maximum sale price in AUD (0 = no maximum)
-        limit:         Maximum results to return (default 20, max 100)
+        suburb:        Suburb name (e.g. "Hazelwood Park", "Taylors Lakes")
+        state:         State abbreviation (e.g. "SA", "VIC", "NSW")
+        postcode:      Postcode (e.g. "5066") — required for non-NSW states
+        street:        Street name only (e.g. "Devereux Road") — optional, triggers
+                       same-street search first for non-NSW states
+        address:       Full address for NSW radius search (e.g. "15 Smith St Castle Hill NSW 2154")
+        radius_km:     Radius in km for NSW address search (default 1.0)
+        property_type: Filter by type — "house", "unit", "land", "other", or "" for all (NSW only)
+        min_price:     Minimum sale price AUD (0 = no minimum, NSW only)
+        max_price:     Maximum sale price AUD (0 = no maximum, NSW only)
+        limit:         Max results (default 20, max 100, NSW only)
     """
     state_norm = state.strip().upper()
 
@@ -112,15 +118,21 @@ async def get_comparable_sales(
             radius_km=radius_km,
         )
 
-    return {
-        "suburb":   suburb,
-        "state":    state,
-        "coverage": "unavailable",
-        "message":  (
-            f"Comparable sales data not available for {state}. "
-            "Use web search as fallback."
-        ),
-    }
+    # All other states — use Scrapfly (REA + Domain)
+    if not postcode:
+        return {
+            "suburb":   suburb,
+            "state":    state,
+            "coverage": "unavailable",
+            "message":  "postcode is required for non-NSW comparable sales lookup.",
+        }
+
+    return await get_scraper_comparable_sales(
+        suburb=suburb,
+        state=state_norm,
+        postcode=postcode,
+        street=street or None,
+    )
 
 
 async def _health(request: Request):
@@ -151,6 +163,8 @@ async def _suburb_median(request: Request):
 async def _comparable_sales(request: Request):
     suburb        = request.query_params.get("suburb",        "").strip()
     state         = request.query_params.get("state",         "").strip()
+    postcode      = request.query_params.get("postcode",      "").strip()
+    street        = request.query_params.get("street",        "").strip()
     property_type = request.query_params.get("property_type", "").strip()
     limit         = int(request.query_params.get("limit",     "20")  or "20")
     min_price     = int(request.query_params.get("min_price", "0")   or "0")
@@ -164,7 +178,10 @@ async def _comparable_sales(request: Request):
             status_code=400,
         )
     try:
-        result = await get_comparable_sales(suburb, state, property_type, min_price, max_price, limit, address, radius_km)
+        result = await get_comparable_sales(
+            suburb, state, postcode, street,
+            property_type, min_price, max_price, limit, address, radius_km,
+        )
         return JSONResponse(result)
     except Exception as e:
         import traceback
