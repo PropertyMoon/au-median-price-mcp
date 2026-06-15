@@ -360,11 +360,15 @@ async def get_scraper_comparable_sales(
     suburb: str,
     state: str,
     postcode: str,
-    street: str | None = None,   # kept for signature compat, not used (saves 1 credit)
+    street: str | None = None,
 ) -> dict:
     """
-    Fetch comparable sold properties from REA + Domain via Scrapfly.
-    Fetches REA and Domain in parallel to keep total latency ~10-15s.
+    Fetch comparable sold properties via Scrapfly.
+
+    Currently Domain-only. REA disabled — migrated to GraphQL/urql cache
+    which requires a new parser; re-enable once fixed.
+
+    Same-street properties (when street is provided) are sorted first.
     """
     if not _SCRAPFLY_KEY:
         return {
@@ -380,33 +384,33 @@ async def get_scraper_comparable_sales(
     cutoff     = datetime.date(prv_yr, 7, 1)
     domain_min = cutoff.strftime("%Y-%m-%d")
 
-    suburb_rea    = suburb.lower().replace(" ", "+")
+    # REA disabled — ArgonautExchange now contains urqlClientCache (GraphQL),
+    # parser needs rewriting before REA can be re-enabled.
+    # suburb_rea = suburb.lower().replace(" ", "+")
+    # rea_url = (
+    #     f"https://www.realestate.com.au/sold/in-{suburb_rea}+"
+    #     f"{state_lower}+{postcode}/list-1"
+    #     f"?includeSurrounding=false&source=refinement&soldIn=12"
+    # )
+
     suburb_domain = suburb.lower().replace(" ", "-")
     state_lower   = state.lower()
 
-    rea_url = (
-        f"https://www.realestate.com.au/sold/in-{suburb_rea}+"
-        f"{state_lower}+{postcode}/list-1"
-        f"?includeSurrounding=false&source=refinement&soldIn=12"
-    )
     domain_url = (
         f"https://www.domain.com.au/sold-listings/{suburb_domain}-{state_lower}-{postcode}/"
         f"?excludepricewithheld=1&ssubs=0&dateRange[min]={domain_min}"
     )
 
-    # Fetch both in parallel — total latency = max(rea, domain) instead of sum
-    rea_html, domain_html = await asyncio.gather(
-        _fetch(rea_url),
-        _fetch(domain_url),
-        return_exceptions=False,
-    )
+    domain_html = await _fetch(domain_url)
 
     all_results: list[dict] = []
 
-    if rea_html:
-        for r in _parse_rea(rea_html):
-            r["proximity_tier"] = "same_suburb"
-            all_results.append(r)
+    # REA disabled — re-enable by un-commenting rea_url above and adding:
+    # rea_html = await _fetch(rea_url)
+    # if rea_html:
+    #     for r in _parse_rea(rea_html):
+    #         r["proximity_tier"] = "same_suburb"
+    #         all_results.append(r)
 
     if domain_html:
         for r in _parse_domain(domain_html):
@@ -428,6 +432,14 @@ async def get_scraper_comparable_sales(
         if _year_from_date(r.get("sale_date")) in (cur_yr, prv_yr, None)
     ]
 
+    # Tag same-street properties and sort them first
+    if street:
+        street_lower = street.lower()
+        for r in filtered:
+            if street_lower in r.get("address", "").lower():
+                r["proximity_tier"] = "same_street"
+        filtered.sort(key=lambda r: 0 if r.get("proximity_tier") == "same_street" else 1)
+
     if not filtered:
         return {
             "suburb":   suburb,
@@ -444,7 +456,7 @@ async def get_scraper_comparable_sales(
         "total_sales_found": len(filtered),
         "comparable_sales":  filtered,
         "data_period":       f"July {prv_yr} – present",
-        "data_source":       "realestate.com.au + domain.com.au (via Scrapfly)",
+        "data_source":       "domain.com.au (via Scrapfly)",
     }
 
 
