@@ -285,6 +285,11 @@ def _parse_domain(html: str) -> list[dict]:
             # for older structures that stored fields directly on the item.
             lm = item.get("listingModel") or item
 
+            # Skip non-sold items — the page may include active listings alongside sold ones.
+            tag_cls = (lm.get("tags") or {}).get("tagClassName", "")
+            if tag_cls and "sold" not in tag_cls.lower():
+                continue
+
             addr = lm.get("address") or item.get("address") or {}
             address_str = (
                 addr.get("fullAddress") or
