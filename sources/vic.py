@@ -30,7 +30,7 @@ _DATASET_PAGE = (
 _LAND_VIC_BASE = "https://www.land.vic.gov.au/__data/assets/excel_doc"
 _PROBE_QUARTERS = [
     # (doc_id_fragment, filename) — add new quarters here as they're published
-    ("0023/762143", "median-house-q2-2025.xls"),  # confirmed working URL
+    ("0023/762143", "median-house-q2-2025.xls"),  # Q2 2025
 ]
 
 _cache: dict = {}
