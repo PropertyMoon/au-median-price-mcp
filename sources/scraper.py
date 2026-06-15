@@ -4,14 +4,15 @@ Scrapfly-based comparable sales scraper — REA + Domain.
 Used as fallback for states not covered by open government datasets
 (i.e. everything except NSW which has the Valuer General bulk data).
 
-Credit-saving design:
-  - No render_js: REA and Domain embed all listing data in server-rendered HTML
-    (window.ArgonautExchange and __NEXT_DATA__ respectively), so JS execution
-    is unnecessary and would multiply credit cost.
-  - soldIn=12 on REA: limits page to last 12 months of sold results.
-  - dateRange[min] on Domain: same date window.
+Credit design:
+  - No render_js: REA and Domain embed listing data in server-rendered HTML.
+  - soldIn=12 on REA, dateRange[min] on Domain: limits results to last 12 months.
+  - REA + Domain fetched in parallel (asyncio.gather) to keep total latency under 20s.
+  - Same-street search omitted — suburb-level gives enough comparables and
+    same-street rarely returns results for smaller suburbs.
 """
 
+import asyncio
 import datetime
 import json
 import os
@@ -47,12 +48,12 @@ async def _fetch(url: str) -> str | None:
         result = data.get("result", {})
         sc = result.get("status_code", 0)
         if sc == 200:
-            print(f"  Scrapfly OK: {url}")
+            print(f"  Scrapfly OK ({len(result.get('content',''))} chars): {url[:80]}")
             return result.get("content")
-        print(f"  Scrapfly status {sc}: {url}")
+        print(f"  Scrapfly status {sc}: {url[:80]}")
         return None
     except Exception as e:
-        print(f"  Scrapfly error ({e}): {url}")
+        print(f"  Scrapfly error ({e}): {url[:80]}")
         return None
 
 
@@ -106,42 +107,81 @@ def _year_from_date(date_str: str | None) -> int | None:
 # REA parser — data lives in window.ArgonautExchange
 # ---------------------------------------------------------------------------
 
+def _looks_like_listing(item: dict) -> bool:
+    """True if this dict has any key that suggests it's a property listing."""
+    keys = set(item.keys())
+    return bool(keys & {"listing", "propertyDetails", "dateSold", "priceDetails",
+                        "address", "price", "soldPrice", "beds", "bedrooms"})
+
+
+def _find_listings_recursive(obj, depth: int = 0) -> list | None:
+    """Walk ArgonautExchange until we find a non-empty list of listing-like dicts."""
+    if depth > 8:
+        return None
+    if isinstance(obj, list) and len(obj) >= 1:
+        if isinstance(obj[0], dict) and _looks_like_listing(obj[0]):
+            return obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            result = _find_listings_recursive(v, depth + 1)
+            if result is not None:
+                return result
+    return None
+
+
 def _parse_rea(html: str) -> list[dict]:
     results = []
-    m = re.search(
-        r"window\.ArgonautExchange\s*=\s*(\{.*?\});\s*(?:window\.|</script>)",
-        html, re.DOTALL,
-    )
+
+    # Extract ArgonautExchange JSON — try two patterns to handle minified vs formatted
+    m = re.search(r"window\.ArgonautExchange\s*=\s*(\{.+?\});\s*(?:window\.|</script>)", html, re.DOTALL)
     if not m:
-        m = re.search(r"window\.ArgonautExchange=(\{.+)", html)
+        m = re.search(r"window\.ArgonautExchange\s*=\s*(\{.+)", html)
     if not m:
-        print("  REA: ArgonautExchange not found")
+        print("  REA: ArgonautExchange not found in page")
         return []
 
-    try:
-        data = json.loads(m.group(1))
-    except json.JSONDecodeError as e:
-        print(f"  REA: JSON parse error: {e}")
+    raw_json = m.group(1)
+    # If greedy match captured too much, truncate at the last balanced brace
+    # (fast sanity: try parse as-is first, then trim)
+    data = None
+    for candidate in (raw_json, raw_json.rsplit("};", 1)[0] + "}"):
+        try:
+            data = json.loads(candidate)
+            break
+        except json.JSONDecodeError:
+            continue
+    if data is None:
+        print("  REA: ArgonautExchange JSON parse failed")
         return []
 
-    listings_raw = []
+    # Log top-level keys to help diagnose future structure changes
+    print(f"  REA ArgonautExchange keys: {list(data.keys())[:6]}")
+
+    # First try the known paths, then fall back to recursive search
+    listings_raw: list | None = None
     for value in data.values():
         if not isinstance(value, dict):
             continue
         d = value.get("data", {})
         if not isinstance(d, dict):
             continue
-        for subkey in ("results", "listings", "data"):
+        for subkey in ("results", "listings", "data", "listingResponseData",
+                       "propertySaleActivityResults", "soldResults"):
             candidate = d.get(subkey)
             if isinstance(candidate, list) and candidate:
                 listings_raw = candidate
+                print(f"  REA: found listings via .data.{subkey} ({len(listings_raw)} items)")
                 break
         if listings_raw:
             break
 
     if not listings_raw:
-        print("  REA: no listings array in ArgonautExchange")
-        return []
+        listings_raw = _find_listings_recursive(data)
+        if listings_raw:
+            print(f"  REA: found listings via recursive search ({len(listings_raw)} items)")
+        else:
+            print("  REA: no listings found — structure unknown, skipping REA")
+            return []
 
     for item in listings_raw:
         try:
@@ -182,7 +222,7 @@ def _parse_rea(html: str) -> list[dict]:
         except Exception as e:
             print(f"  REA item error: {e}")
 
-    print(f"  REA: {len(results)} listings parsed")
+    print(f"  REA: {len(results)} listings extracted")
     return results
 
 
@@ -273,7 +313,7 @@ def _parse_domain(html: str) -> list[dict]:
         except Exception as e:
             print(f"  Domain item error: {e}")
 
-    print(f"  Domain: {len(results)} listings parsed")
+    print(f"  Domain: {len(results)} listings extracted")
     return results
 
 
@@ -285,11 +325,11 @@ async def get_scraper_comparable_sales(
     suburb: str,
     state: str,
     postcode: str,
-    street: str | None = None,
+    street: str | None = None,   # kept for signature compat, not used (saves 1 credit)
 ) -> dict:
     """
     Fetch comparable sold properties from REA + Domain via Scrapfly.
-    Returns a dict with coverage, comparable_sales list, and data_source.
+    Fetches REA and Domain in parallel to keep total latency ~10-15s.
     """
     if not _SCRAPFLY_KEY:
         return {
@@ -299,53 +339,42 @@ async def get_scraper_comparable_sales(
             "message":  "SCRAPFLY_API_KEY not configured.",
         }
 
-    now       = datetime.datetime.now()
-    cur_yr    = now.year
-    prv_yr    = now.year - 1
-    # Date window: current year + second half of previous year
-    cutoff    = datetime.date(prv_yr, 7, 1)
+    now        = datetime.datetime.now()
+    cur_yr     = now.year
+    prv_yr     = now.year - 1
+    cutoff     = datetime.date(prv_yr, 7, 1)
     domain_min = cutoff.strftime("%Y-%m-%d")
 
     suburb_rea    = suburb.lower().replace(" ", "+")
     suburb_domain = suburb.lower().replace(" ", "-")
     state_lower   = state.lower()
 
-    all_results: list[dict] = []
-
-    # 1. Same-street on REA (if street provided)
-    if street:
-        street_slug = street.lower().replace(" ", "+")
-        url = (
-            f"https://www.realestate.com.au/sold/in-{street_slug}+"
-            f"{suburb_rea}+{state_lower}+{postcode}/list-1"
-            f"?includeSurrounding=false&soldIn=12"
-        )
-        html = await _fetch(url)
-        if html:
-            for r in _parse_rea(html):
-                r["proximity_tier"] = "same_street"
-                all_results.append(r)
-
-    # 2. Suburb-level: REA
-    url = (
+    rea_url = (
         f"https://www.realestate.com.au/sold/in-{suburb_rea}+"
         f"{state_lower}+{postcode}/list-1"
         f"?includeSurrounding=false&source=refinement&soldIn=12"
     )
-    html = await _fetch(url)
-    if html:
-        for r in _parse_rea(html):
-            r["proximity_tier"] = "same_suburb"
-            all_results.append(r)
-
-    # 3. Suburb-level: Domain
-    url = (
+    domain_url = (
         f"https://www.domain.com.au/sold-listings/{suburb_domain}-{state_lower}-{postcode}/"
         f"?excludepricewithheld=1&ssubs=0&dateRange[min]={domain_min}"
     )
-    html = await _fetch(url)
-    if html:
-        for r in _parse_domain(html):
+
+    # Fetch both in parallel — total latency = max(rea, domain) instead of sum
+    rea_html, domain_html = await asyncio.gather(
+        _fetch(rea_url),
+        _fetch(domain_url),
+        return_exceptions=False,
+    )
+
+    all_results: list[dict] = []
+
+    if rea_html:
+        for r in _parse_rea(rea_html):
+            r["proximity_tier"] = "same_suburb"
+            all_results.append(r)
+
+    if domain_html:
+        for r in _parse_domain(domain_html):
             r["proximity_tier"] = "same_suburb"
             all_results.append(r)
 
