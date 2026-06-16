@@ -33,6 +33,7 @@ from sources.scraper import (
     get_scraper_comparable_sales,
     debug_scraper_comparable_sales,
     scrape_domain_suburb_median,
+    debug_domain_suburb_profile,
 )
 
 mcp = FastMCP("au-median-price", stateless_http=True)
@@ -234,13 +235,32 @@ async def _comparable_sales(request: Request):
         )
 
 
+async def _debug_suburb_profile(request: Request):
+    suburb   = request.query_params.get("suburb",   "").strip()
+    state    = request.query_params.get("state",    "").strip()
+    postcode = request.query_params.get("postcode", "").strip()
+    if not suburb or not state or not postcode:
+        return JSONResponse(
+            {"error": "suburb, state and postcode query params are required"},
+            status_code=400,
+        )
+    try:
+        result = await debug_domain_suburb_profile(suburb, state, postcode)
+        return JSONResponse(result)
+    except Exception as e:
+        import traceback
+        return JSONResponse({"error": str(e), "traceback": traceback.format_exc()},
+                            status_code=500)
+
+
 _mcp_app = mcp.streamable_http_app()
 app = Starlette(
     routes=[
-        Route("/health",                  _health),
-        Route("/suburb-median",           _suburb_median),
-        Route("/comparable-sales",        _comparable_sales),
-        Route("/debug-comparable-sales",  _debug_comparable_sales),
+        Route("/health",                   _health),
+        Route("/suburb-median",            _suburb_median),
+        Route("/comparable-sales",         _comparable_sales),
+        Route("/debug-comparable-sales",   _debug_comparable_sales),
+        Route("/debug-suburb-profile",     _debug_suburb_profile),
         Mount("/", _mcp_app),
     ]
 )

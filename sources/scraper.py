@@ -32,31 +32,66 @@ _SCRAPFLY_URL = "https://api.scrapfly.io/scrape"
 # ---------------------------------------------------------------------------
 
 async def _fetch(url: str) -> str | None:
+    """
+    Fetch via Scrapfly. Tries without ASP first (cheaper / avoids 422 on
+    restricted plans); retries with asp=true if the target page returns a
+    bot-detection status (403/503/429). Logs the full Scrapfly error body
+    on API-level failures so we can diagnose plan/credit issues.
+    """
     if not _SCRAPFLY_KEY:
         return None
-    params = {
-        "key":     _SCRAPFLY_KEY,
-        "url":     url,
-        "asp":     "true",
-        "country": "au",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.get(_SCRAPFLY_URL, params=params)
-        r.raise_for_status()
-        data = r.json()
+
+    for attempt, use_asp in enumerate((False, True), start=1):
+        params: dict = {
+            "key":     _SCRAPFLY_KEY,
+            "url":     url,
+            "country": "au",
+        }
+        if use_asp:
+            params["asp"] = "true"
+
+        label = "asp" if use_asp else "no-asp"
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.get(_SCRAPFLY_URL, params=params)
+        except Exception as e:
+            raw = f"{type(e).__name__}: {str(e)}"
+            err = raw.replace(_SCRAPFLY_KEY, "scp-***") if _SCRAPFLY_KEY else raw
+            print(f"  Scrapfly network error ({label}, attempt {attempt}): {err} — {url[:80]}")
+            if not use_asp:
+                continue
+            return None
+
+        # Scrapfly API returned a non-200 HTTP status — log the body for diagnosis
+        if r.status_code != 200:
+            try:
+                body = r.json()
+                msg = (body.get("message") or body.get("error")
+                       or body.get("description") or json.dumps(body)[:300])
+            except Exception:
+                msg = r.text[:300]
+            msg = msg.replace(_SCRAPFLY_KEY, "scp-***") if _SCRAPFLY_KEY else msg
+            print(f"  Scrapfly {r.status_code} ({label}, attempt {attempt}): {msg} — {url[:80]}")
+            # 422 with ASP = plan restriction; 422 without ASP = retry with ASP
+            if not use_asp:
+                continue
+            return None
+
+        data   = r.json()
         result = data.get("result", {})
-        sc = result.get("status_code", 0)
+        sc     = result.get("status_code", 0)
+
         if sc == 200:
-            print(f"  Scrapfly OK ({len(result.get('content',''))} chars): {url[:80]}")
+            print(f"  Scrapfly OK ({len(result.get('content', ''))} chars, {label}): {url[:80]}")
             return result.get("content")
-        print(f"  Scrapfly status {sc}: {url[:80]}")
+
+        # Bot-detection from the target site — retry with ASP if we haven't yet
+        print(f"  Scrapfly target-status {sc} ({label}): {url[:80]}")
+        if sc in (403, 503, 429) and not use_asp:
+            continue
         return None
-    except Exception as e:
-        raw_msg = f"{type(e).__name__}: {str(e)}"
-        err_msg = raw_msg.replace(_SCRAPFLY_KEY, "scp-***") if _SCRAPFLY_KEY else raw_msg
-        print(f"  Scrapfly error ({err_msg}): {url[:80]}")
-        return None
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -357,13 +392,92 @@ def _parse_domain(html: str) -> list[dict]:
 # Domain suburb profile — median price + rental yield
 # ---------------------------------------------------------------------------
 
+def _parse_domain_next_data(html: str) -> dict | None:
+    """Extract and JSON-parse __NEXT_DATA__ from a Domain Next.js page."""
+    m = re.search(r'<script\s+id="__NEXT_DATA__"[^>]*>([^<]+)</script>', html)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+
+
+def _extract_price_history(page_props: dict) -> list[dict]:
+    """
+    Try multiple known paths for year-by-year price history in Domain's
+    suburb profile __NEXT_DATA__. Returns list of {year, median_house_price}.
+    """
+    candidates: list = []
+
+    # Path 1: suburbInsights.priceHistory or suburbInsights.medians.house.priceHistory
+    si = page_props.get("suburbInsights") or {}
+    for path in [
+        si.get("priceHistory"),
+        (si.get("medians") or {}).get("house", {}).get("priceHistory"),
+        (si.get("medians") or {}).get("houses", {}).get("priceHistory"),
+        si.get("historicalData"),
+        si.get("historicalPrices"),
+    ]:
+        if isinstance(path, list) and path:
+            candidates = path
+            break
+
+    # Path 2: componentProps sub-sections
+    if not candidates:
+        comp = page_props.get("componentProps") or {}
+        for section_key in ("priceHistory", "historicalSales", "historicalData",
+                             "medianPriceHistory", "suburbHistory"):
+            raw = comp.get(section_key) or page_props.get(section_key)
+            if isinstance(raw, list) and raw:
+                candidates = raw
+                break
+            if isinstance(raw, dict):
+                # might be {house: [...], unit: [...]}
+                inner = raw.get("house") or raw.get("houses") or []
+                if isinstance(inner, list) and inner:
+                    candidates = inner
+                    break
+
+    if not candidates:
+        return []
+
+    points: list[dict] = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        yr = (item.get("year") or item.get("financialYear")
+              or item.get("calendarYear") or item.get("period"))
+        price = (item.get("medianSalePrice") or item.get("soldMedianPrice")
+                 or item.get("medianPrice") or item.get("price")
+                 or item.get("median"))
+        if yr is None or price is None:
+            continue
+        try:
+            year_int = int(str(yr)[:4])
+            price_int = _parse_price(price)
+        except (ValueError, TypeError):
+            continue
+        if price_int and 2018 <= year_int <= 2030:
+            points.append({"year": year_int, "median_house_price": price_int})
+
+    # Deduplicate and sort, keep last 6
+    seen: set = set()
+    unique = []
+    for p in sorted(points, key=lambda x: x["year"]):
+        if p["year"] not in seen:
+            seen.add(p["year"])
+            unique.append(p)
+    return unique[-6:]
+
+
 async def scrape_domain_suburb_median(suburb: str, state: str, postcode: str) -> dict | None:
     """
-    Scrape domain.com.au/suburb-profile for median house/unit price and gross rental yield.
+    Scrape domain.com.au/suburb-profile for median prices, gross rental yield,
+    and year-by-year price history (last 6 years).
 
-    Returns a dict with coverage="available" and the same field names used by the
-    VIC/NSW MCP sources, so callers can treat the result uniformly.
-    Returns None if Scrapfly key is missing, the fetch fails, or no price data is found.
+    Returns a dict with coverage="available" using the same field names as the
+    VIC/NSW MCP sources. Returns None if fetch or parse fails.
     """
     if not _SCRAPFLY_KEY:
         return None
@@ -376,26 +490,20 @@ async def scrape_domain_suburb_median(suburb: str, state: str, postcode: str) ->
     if not html:
         return None
 
-    m = re.search(r'<script\s+id="__NEXT_DATA__"[^>]*>([^<]+)</script>', html)
-    if not m:
+    nd = _parse_domain_next_data(html)
+    if not nd:
         print(f"  Domain suburb profile: __NEXT_DATA__ not found for {suburb} {state}")
-        return None
-
-    try:
-        nd = json.loads(m.group(1))
-    except json.JSONDecodeError as e:
-        print(f"  Domain suburb profile: JSON parse error: {e}")
         return None
 
     page_props = nd.get("props", {}).get("pageProps", {})
 
-    median_house = None
-    median_unit  = None
-    gross_yield  = None
-    data_period  = None
+    median_house  = None
+    median_unit   = None
+    gross_yield   = None
+    data_period   = None
 
-    # --- Path 1: suburbInsights.medians (observed in 2024-2025 structure) ---
-    si = page_props.get("suburbInsights") or {}
+    # --- Path 1: suburbInsights.medians ---
+    si      = page_props.get("suburbInsights") or {}
     medians = si.get("medians") or {}
     for h_key in ("house", "houses"):
         h = medians.get(h_key) or {}
@@ -425,8 +533,7 @@ async def scrape_domain_suburb_median(suburb: str, state: str, postcode: str) ->
                  or h.get("medianPrice") or h.get("price"))
             if p:
                 median_house = p
-                gross_yield  = (h.get("grossYield") or h.get("yield")
-                                or h.get("rentalYield"))
+                gross_yield  = h.get("grossYield") or h.get("yield") or h.get("rentalYield")
                 data_period  = section.get("period") or section.get("dataPeriod")
                 u = section.get("unit") or section.get("units") or {}
                 median_unit  = (u.get("medianSalePrice") or u.get("soldMedianPrice")
@@ -454,15 +561,17 @@ async def scrape_domain_suburb_median(suburb: str, state: str, postcode: str) ->
         )
         return None
 
+    hp            = _parse_price(median_house)
+    up            = _parse_price(median_unit) if median_unit else None
+    price_history = _extract_price_history(page_props)
+
     result: dict = {
-        "suburb":             suburb,
-        "state":              state,
-        "coverage":           "available",
-        "data_period":        data_period or "last 12 months",
-        "data_source":        "domain.com.au suburb profile (via Scrapfly)",
+        "suburb":      suburb,
+        "state":       state,
+        "coverage":    "available",
+        "data_period": data_period or "last 12 months",
+        "data_source": "domain.com.au suburb profile (via Scrapfly)",
     }
-    hp = _parse_price(median_house)
-    up = _parse_price(median_unit) if median_unit else None
     if hp:
         result["median_house_price"] = hp
     if up:
@@ -472,14 +581,63 @@ async def scrape_domain_suburb_median(suburb: str, state: str, postcode: str) ->
             result["gross_rental_yield"] = float(gross_yield)
         except (TypeError, ValueError):
             pass
+    if price_history:
+        result["price_history_5yr"] = price_history
 
     print(
         f"  Domain suburb profile: {suburb} {state} — "
-        f"house=${hp:,} unit=${up:,} yield={gross_yield}"
-        if hp and up else
-        f"  Domain suburb profile: {suburb} {state} — house=${hp} unit={up}"
+        f"house=${hp:,} unit={f'${up:,}' if up else 'n/a'} "
+        f"yield={gross_yield} history={len(price_history)} pts"
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Debug helper — Domain suburb profile __NEXT_DATA__ structure
+# ---------------------------------------------------------------------------
+
+async def debug_domain_suburb_profile(suburb: str, state: str, postcode: str) -> dict:
+    """
+    Diagnostic endpoint: fetch Domain suburb profile and return __NEXT_DATA__
+    structure summary so parser paths can be verified/fixed.
+    """
+    suburb_slug = suburb.lower().replace(" ", "-")
+    state_lower = state.lower()
+    url = f"https://www.domain.com.au/suburb-profile/{suburb_slug}-{state_lower}-{postcode}"
+
+    html = await _fetch(url)
+    if not html:
+        return {"error": "fetch failed", "url": url}
+
+    nd = _parse_domain_next_data(html)
+    if not nd:
+        return {
+            "error": "__NEXT_DATA__ not found",
+            "url": url,
+            "html_length": len(html),
+            "html_preview": html[:500],
+        }
+
+    page_props = nd.get("props", {}).get("pageProps", {})
+
+    def _summarise(obj, depth: int = 0):
+        if depth > 3:
+            return "…"
+        if isinstance(obj, dict):
+            return {k: _summarise(v, depth + 1) for k, v in list(obj.items())[:12]}
+        if isinstance(obj, list):
+            if not obj:
+                return []
+            first = _summarise(obj[0], depth + 1)
+            return [first, f"…({len(obj)} items)"] if len(obj) > 1 else [first]
+        return obj
+
+    return {
+        "url":               url,
+        "page_props_keys":   list(page_props.keys()),
+        "page_props_summary": _summarise(page_props),
+        "price_history_attempt": _extract_price_history(page_props),
+    }
 
 
 # ---------------------------------------------------------------------------
