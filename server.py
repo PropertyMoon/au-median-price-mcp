@@ -4,9 +4,10 @@ and comparable sales data.
 
 Median price coverage:
   NSW: NSW Valuer General bulk sales .DAT files (weekly, CC BY 4.0)
-  VIC: Victorian Property Sales Report quarterly XLS (data.vic.gov.au),
-       falls back to Domain suburb profile scrape (Scrapfly) if XLS unavailable
-  All other states: Domain suburb profile scrape (Scrapfly, requires postcode)
+  All other states (VIC, QLD, SA, WA, TAS, NT, ACT):
+    Domain suburb profile scrape via Scrapfly (requires postcode).
+    The VIC Valuer-General XLS in vic.py is available for local/dev use but
+    consistently 403s on Railway (cloud IPs blocked), so it is bypassed here.
 
 Comparable sales coverage:
   NSW: NSW Valuer General (authoritative, supports radius/type/price filters)
@@ -49,9 +50,7 @@ async def get_suburb_median(suburb: str, state: str, postcode: str = "") -> dict
     "unavailable"), and data_source.
 
     Coverage:
-    - NSW: NSW Valuer General bulk sales data (weekly, CC BY 4.0) — primary
-    - VIC: Victorian Property Sales Report quarterly (data.vic.gov.au) — primary,
-           falls back to Domain suburb profile via Scrapfly if XLS unavailable
+    - NSW: NSW Valuer General bulk sales data (weekly, CC BY 4.0)
     - All other states: Domain suburb profile via Scrapfly (requires postcode)
 
     Args:
@@ -65,18 +64,10 @@ async def get_suburb_median(suburb: str, state: str, postcode: str = "") -> dict
     if state_norm in ("NSW", "NEW SOUTH WALES"):
         return await get_nsw_median(suburb)
 
-    if state_norm in ("VIC", "VICTORIA"):
-        result = await get_vic_median(suburb)
-        if result.get("coverage") == "available":
-            return result
-        # XLS failed or suburb not in dataset — fall back to Domain scrape
-        if postcode:
-            scraped = await scrape_domain_suburb_median(suburb, "VIC", postcode)
-            if scraped:
-                return scraped
-        return result  # return the original no_data / unavailable response
-
-    # All other states (QLD, SA, WA, TAS, NT, ACT) — Domain suburb profile only
+    # VIC and all other states — Domain suburb profile via Scrapfly.
+    # Note: the VIC Valuer-General XLS (vic.py) is available for local/dev use but
+    # consistently 403s on Railway (cloud IPs blocked by land.vic.gov.au), so we go
+    # straight to Domain scraping for all non-NSW states.
     if postcode:
         scraped = await scrape_domain_suburb_median(suburb, state_norm, postcode)
         if scraped:
