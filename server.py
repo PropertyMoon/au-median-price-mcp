@@ -3,9 +3,10 @@ au-median-price-mcp — MCP server providing Australian suburb median property p
 and comparable sales data.
 
 Median price coverage:
-  VIC: Victorian Property Sales Report quarterly XLS (data.vic.gov.au)
   NSW: NSW Valuer General bulk sales .DAT files (weekly, CC BY 4.0)
-  All other states: unavailable — caller falls back to web search
+  VIC: Victorian Property Sales Report quarterly XLS (data.vic.gov.au),
+       falls back to Domain suburb profile scrape (Scrapfly) if XLS unavailable
+  All other states: Domain suburb profile scrape (Scrapfly, requires postcode)
 
 Comparable sales coverage:
   NSW: NSW Valuer General (authoritative, supports radius/type/price filters)
@@ -28,43 +29,65 @@ from starlette.routing import Mount, Route
 
 from sources.vic import get_vic_median
 from sources.nsw import get_nsw_median, get_nsw_comparable_sales
-from sources.scraper import get_scraper_comparable_sales, debug_scraper_comparable_sales
+from sources.scraper import (
+    get_scraper_comparable_sales,
+    debug_scraper_comparable_sales,
+    scrape_domain_suburb_median,
+)
 
 mcp = FastMCP("au-median-price", stateless_http=True)
 
 
 @mcp.tool()
-async def get_suburb_median(suburb: str, state: str) -> dict:
+async def get_suburb_median(suburb: str, state: str, postcode: str = "") -> dict:
     """
     Get median property sale prices for an Australian suburb.
 
     Returns median_house_price (int, AUD), median_unit_price (int, AUD),
-    data_period, coverage ("available" | "no_data" | "unavailable"), and data_source.
+    gross_rental_yield (float, %), data_period, coverage ("available" | "no_data" |
+    "unavailable"), and data_source.
 
     Coverage:
-    - VIC: Victorian Property Sales Report quarterly (data.vic.gov.au)
-    - NSW: NSW Valuer General bulk sales data (weekly, CC BY 4.0)
-    - All other states: unavailable — use web search as fallback
+    - NSW: NSW Valuer General bulk sales data (weekly, CC BY 4.0) — primary
+    - VIC: Victorian Property Sales Report quarterly (data.vic.gov.au) — primary,
+           falls back to Domain suburb profile via Scrapfly if XLS unavailable
+    - All other states: Domain suburb profile via Scrapfly (requires postcode)
 
     Args:
-        suburb: Suburb name (e.g. "Taylors Lakes", "Paddington")
-        state:  State abbreviation (e.g. "VIC", "NSW", "QLD")
+        suburb:   Suburb name (e.g. "Taylors Lakes", "Paddington")
+        state:    State abbreviation (e.g. "VIC", "NSW", "QLD")
+        postcode: Postcode string (e.g. "3038") — required for non-NSW states
+                  to enable Domain suburb profile scraping
     """
     state_norm = state.strip().upper()
 
-    if state_norm in ("VIC", "VICTORIA"):
-        return await get_vic_median(suburb)
-
     if state_norm in ("NSW", "NEW SOUTH WALES"):
         return await get_nsw_median(suburb)
+
+    if state_norm in ("VIC", "VICTORIA"):
+        result = await get_vic_median(suburb)
+        if result.get("coverage") == "available":
+            return result
+        # XLS failed or suburb not in dataset — fall back to Domain scrape
+        if postcode:
+            scraped = await scrape_domain_suburb_median(suburb, "VIC", postcode)
+            if scraped:
+                return scraped
+        return result  # return the original no_data / unavailable response
+
+    # All other states (QLD, SA, WA, TAS, NT, ACT) — Domain suburb profile only
+    if postcode:
+        scraped = await scrape_domain_suburb_median(suburb, state_norm, postcode)
+        if scraped:
+            return scraped
 
     return {
         "suburb":   suburb,
         "state":    state,
         "coverage": "unavailable",
         "message":  (
-            f"Median price data not available for {state}. "
-            "Use web search as fallback."
+            f"Median price data not available for {state}."
+            + (" Postcode required for Domain scraping." if not postcode else "")
         ),
     }
 
@@ -157,15 +180,16 @@ async def _debug_comparable_sales(request: Request):
 
 
 async def _suburb_median(request: Request):
-    suburb = request.query_params.get("suburb", "").strip()
-    state  = request.query_params.get("state",  "").strip()
+    suburb   = request.query_params.get("suburb",   "").strip()
+    state    = request.query_params.get("state",    "").strip()
+    postcode = request.query_params.get("postcode", "").strip()
     if not suburb or not state:
         return JSONResponse(
             {"error": "suburb and state query params are required"},
             status_code=400,
         )
     try:
-        result = await get_suburb_median(suburb, state)
+        result = await get_suburb_median(suburb, state, postcode)
         return JSONResponse(result)
     except Exception as e:
         import traceback

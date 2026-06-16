@@ -53,7 +53,8 @@ async def _fetch(url: str) -> str | None:
         print(f"  Scrapfly status {sc}: {url[:80]}")
         return None
     except Exception as e:
-        err_msg = str(e).replace(_SCRAPFLY_KEY, "scp-***") if _SCRAPFLY_KEY else str(e)
+        raw_msg = f"{type(e).__name__}: {str(e)}"
+        err_msg = raw_msg.replace(_SCRAPFLY_KEY, "scp-***") if _SCRAPFLY_KEY else raw_msg
         print(f"  Scrapfly error ({err_msg}): {url[:80]}")
         return None
 
@@ -350,6 +351,135 @@ def _parse_domain(html: str) -> list[dict]:
 
     print(f"  Domain: {len(results)} listings extracted")
     return results
+
+
+# ---------------------------------------------------------------------------
+# Domain suburb profile — median price + rental yield
+# ---------------------------------------------------------------------------
+
+async def scrape_domain_suburb_median(suburb: str, state: str, postcode: str) -> dict | None:
+    """
+    Scrape domain.com.au/suburb-profile for median house/unit price and gross rental yield.
+
+    Returns a dict with coverage="available" and the same field names used by the
+    VIC/NSW MCP sources, so callers can treat the result uniformly.
+    Returns None if Scrapfly key is missing, the fetch fails, or no price data is found.
+    """
+    if not _SCRAPFLY_KEY:
+        return None
+
+    suburb_slug = suburb.lower().replace(" ", "-")
+    state_lower = state.lower()
+    url = f"https://www.domain.com.au/suburb-profile/{suburb_slug}-{state_lower}-{postcode}"
+
+    html = await _fetch(url)
+    if not html:
+        return None
+
+    m = re.search(r'<script\s+id="__NEXT_DATA__"[^>]*>([^<]+)</script>', html)
+    if not m:
+        print(f"  Domain suburb profile: __NEXT_DATA__ not found for {suburb} {state}")
+        return None
+
+    try:
+        nd = json.loads(m.group(1))
+    except json.JSONDecodeError as e:
+        print(f"  Domain suburb profile: JSON parse error: {e}")
+        return None
+
+    page_props = nd.get("props", {}).get("pageProps", {})
+
+    median_house = None
+    median_unit  = None
+    gross_yield  = None
+    data_period  = None
+
+    # --- Path 1: suburbInsights.medians (observed in 2024-2025 structure) ---
+    si = page_props.get("suburbInsights") or {}
+    medians = si.get("medians") or {}
+    for h_key in ("house", "houses"):
+        h = medians.get(h_key) or {}
+        p = h.get("medianSalePrice") or h.get("soldMedianPrice") or h.get("price")
+        if p:
+            median_house = p
+            gross_yield  = h.get("grossYield") or h.get("yield") or h.get("rentalYield")
+            data_period  = h.get("period") or si.get("dataPeriod") or si.get("period")
+            break
+    for u_key in ("unit", "units"):
+        u = medians.get(u_key) or {}
+        p = u.get("medianSalePrice") or u.get("soldMedianPrice") or u.get("price")
+        if p:
+            median_unit = p
+            break
+
+    # --- Path 2: componentProps sub-sections ---
+    if not median_house:
+        comp = page_props.get("componentProps") or {}
+        for section_key in ("suburbStatistics", "marketInsights", "statistics",
+                             "suburbProfile", "insights", "marketTrends"):
+            section = comp.get(section_key) or page_props.get(section_key) or {}
+            h = section.get("house") or section.get("houses") or {}
+            if not isinstance(h, dict):
+                h = section
+            p = (h.get("medianSalePrice") or h.get("soldMedianPrice")
+                 or h.get("medianPrice") or h.get("price"))
+            if p:
+                median_house = p
+                gross_yield  = (h.get("grossYield") or h.get("yield")
+                                or h.get("rentalYield"))
+                data_period  = section.get("period") or section.get("dataPeriod")
+                u = section.get("unit") or section.get("units") or {}
+                median_unit  = (u.get("medianSalePrice") or u.get("soldMedianPrice")
+                                or u.get("price"))
+                break
+
+    # --- Path 3: flat fields on pageProps ---
+    if not median_house:
+        for key in ("medianHousePrice", "houseMedSalePrice", "houseMedianPrice"):
+            if page_props.get(key):
+                median_house = page_props[key]
+                break
+    if not median_unit:
+        for key in ("medianUnitPrice", "unitMedSalePrice", "unitMedianPrice"):
+            if page_props.get(key):
+                median_unit = page_props[key]
+                break
+
+    if not median_house and not median_unit:
+        comp_keys = list((page_props.get("componentProps") or {}).keys())[:15]
+        print(
+            f"  Domain suburb profile: no median found for {suburb} {state}. "
+            f"pageProps keys={list(page_props.keys())[:15]} "
+            f"componentProps keys={comp_keys}"
+        )
+        return None
+
+    result: dict = {
+        "suburb":             suburb,
+        "state":              state,
+        "coverage":           "available",
+        "data_period":        data_period or "last 12 months",
+        "data_source":        "domain.com.au suburb profile (via Scrapfly)",
+    }
+    hp = _parse_price(median_house)
+    up = _parse_price(median_unit) if median_unit else None
+    if hp:
+        result["median_house_price"] = hp
+    if up:
+        result["median_unit_price"] = up
+    if gross_yield is not None:
+        try:
+            result["gross_rental_yield"] = float(gross_yield)
+        except (TypeError, ValueError):
+            pass
+
+    print(
+        f"  Domain suburb profile: {suburb} {state} — "
+        f"house=${hp:,} unit=${up:,} yield={gross_yield}"
+        if hp and up else
+        f"  Domain suburb profile: {suburb} {state} — house=${hp} unit={up}"
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
