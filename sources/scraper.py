@@ -383,72 +383,182 @@ def _parse_domain_next_data(html: str) -> dict | None:
         return None
 
 
-def _extract_price_history(page_props: dict) -> list[dict]:
+def _parse_apollo_suburb_data(apollo: dict) -> tuple:
     """
-    Try multiple known paths for year-by-year price history in Domain's
-    suburb profile __NEXT_DATA__. Returns list of {year, median_house_price}.
+    Parse Domain's Apollo Client normalized cache (__APOLLO_STATE__).
+
+    Apollo stores entities as a flat dict keyed by "TypeName:id".
+    We scan every entry looking for AU house-price–shaped values and
+    year-series arrays, then classify house vs unit from the key name.
+
+    Returns (median_house, median_unit, gross_yield, price_history, data_period).
     """
-    candidates: list = []
+    PRICE_PRICE_FIELDS = (
+        "medianSalePrice", "soldMedianPrice", "medianPrice",
+        "median", "price", "value",
+    )
+    YIELD_FIELDS = (
+        "grossYield", "rentalYield", "yield", "grossRentalYield", "rentalReturn",
+    )
+    HISTORY_FIELDS = (
+        "priceHistory", "historicalData", "medianHistory",
+        "soldPriceHistory", "history", "timeSeries", "annualData",
+    )
+    PERIOD_FIELDS = ("period", "dataPeriod", "quarter", "financialYear", "year")
 
-    # Path 1: suburbInsights.priceHistory or suburbInsights.medians.house.priceHistory
-    si = page_props.get("suburbInsights") or {}
-    for path in [
-        si.get("priceHistory"),
-        (si.get("medians") or {}).get("house", {}).get("priceHistory"),
-        (si.get("medians") or {}).get("houses", {}).get("priceHistory"),
-        si.get("historicalData"),
-        si.get("historicalPrices"),
-    ]:
-        if isinstance(path, list) and path:
-            candidates = path
-            break
+    _AU_PRICE_MIN, _AU_PRICE_MAX = 80_000, 20_000_000
+    _YIELD_MIN,    _YIELD_MAX    = 0.5,    25.0
 
-    # Path 2: componentProps sub-sections
-    if not candidates:
-        comp = page_props.get("componentProps") or {}
-        for section_key in ("priceHistory", "historicalSales", "historicalData",
-                             "medianPriceHistory", "suburbHistory"):
-            raw = comp.get(section_key) or page_props.get(section_key)
-            if isinstance(raw, list) and raw:
-                candidates = raw
-                break
-            if isinstance(raw, dict):
-                # might be {house: [...], unit: [...]}
-                inner = raw.get("house") or raw.get("houses") or []
-                if isinstance(inner, list) and inner:
-                    candidates = inner
+    median_house: int | None  = None
+    median_unit:  int | None  = None
+    gross_yield:  float | None = None
+    data_period:  str | None  = None
+    price_history: list[dict] = []
+
+    # Apollo keys: group by the type-name prefix (before the first ":")
+    # so we can log useful diagnostics and prioritise relevant types.
+    type_buckets: dict[str, list[dict]] = {}
+    for cache_key, entry in apollo.items():
+        if not isinstance(entry, dict):
+            continue
+        type_name = cache_key.split(":")[0] if ":" in cache_key else cache_key
+        type_buckets.setdefault(type_name, []).append((cache_key, entry))
+
+    print(f"  Apollo types ({len(type_buckets)}): {list(type_buckets.keys())[:20]}")
+
+    def _resolve(val, apollo_cache: dict):
+        """Follow a single Apollo __ref if present."""
+        if isinstance(val, dict) and "__ref" in val:
+            return apollo_cache.get(val["__ref"], {})
+        return val
+
+    for cache_key, entry in apollo.items():
+        if not isinstance(entry, dict):
+            continue
+
+        key_lower = cache_key.lower()
+        is_house  = any(t in key_lower for t in ("house", "residential", "dwelling"))
+        is_unit   = any(t in key_lower for t in ("unit", "apartment", "flat", "townhouse"))
+
+        # --- Price ---
+        for field in PRICE_PRICE_FIELDS:
+            raw = entry.get(field)
+            raw = _resolve(raw, apollo)
+            if raw is None:
+                continue
+            p = _parse_price(raw)
+            if not p or not (_AU_PRICE_MIN <= p <= _AU_PRICE_MAX):
+                continue
+            if is_unit and median_unit is None:
+                median_unit = p
+            elif (is_house or not is_unit) and median_house is None:
+                median_house = p
+                # grab yield from same entry
+                for yf in YIELD_FIELDS:
+                    yv = entry.get(yf)
+                    yv = _resolve(yv, apollo)
+                    if yv is not None:
+                        try:
+                            yf_float = float(str(yv).replace("%", ""))
+                            if _YIELD_MIN <= yf_float <= _YIELD_MAX:
+                                gross_yield = yf_float
+                                break
+                        except (ValueError, TypeError):
+                            pass
+                for pf in PERIOD_FIELDS:
+                    pv = entry.get(pf)
+                    if pv and isinstance(pv, str) and len(pv) >= 4:
+                        data_period = pv
+                        break
+            break  # one price field per entry is enough
+
+        # Also check nested house/unit sub-objects
+        for sub_key, sub_label, store_house in (
+            ("house",       "house",  True),
+            ("houses",      "house",  True),
+            ("residential", "house",  True),
+            ("unit",        "unit",   False),
+            ("units",       "unit",   False),
+            ("apartment",   "unit",   False),
+        ):
+            sub = entry.get(sub_key)
+            sub = _resolve(sub, apollo)
+            if not isinstance(sub, dict):
+                continue
+            for field in PRICE_PRICE_FIELDS:
+                p = _parse_price(sub.get(field))
+                if p and _AU_PRICE_MIN <= p <= _AU_PRICE_MAX:
+                    if store_house and median_house is None:
+                        median_house = p
+                        for yf in YIELD_FIELDS:
+                            yv = sub.get(yf)
+                            if yv is not None:
+                                try:
+                                    yf_float = float(str(yv).replace("%", ""))
+                                    if _YIELD_MIN <= yf_float <= _YIELD_MAX:
+                                        gross_yield = yf_float
+                                        break
+                                except (ValueError, TypeError):
+                                    pass
+                    elif not store_house and median_unit is None:
+                        median_unit = p
                     break
 
-    if not candidates:
-        return []
+        # --- Yield (standalone) ---
+        if gross_yield is None:
+            for yf in YIELD_FIELDS:
+                yv = entry.get(yf)
+                yv = _resolve(yv, apollo)
+                if yv is not None:
+                    try:
+                        yf_float = float(str(yv).replace("%", ""))
+                        if _YIELD_MIN <= yf_float <= _YIELD_MAX:
+                            gross_yield = yf_float
+                            break
+                    except (ValueError, TypeError):
+                        pass
 
-    points: list[dict] = []
-    for item in candidates:
-        if not isinstance(item, dict):
-            continue
-        yr = (item.get("year") or item.get("financialYear")
-              or item.get("calendarYear") or item.get("period"))
-        price = (item.get("medianSalePrice") or item.get("soldMedianPrice")
-                 or item.get("medianPrice") or item.get("price")
-                 or item.get("median"))
-        if yr is None or price is None:
-            continue
-        try:
-            year_int = int(str(yr)[:4])
-            price_int = _parse_price(price)
-        except (ValueError, TypeError):
-            continue
-        if price_int and 2018 <= year_int <= 2030:
-            points.append({"year": year_int, "median_house_price": price_int})
+        # --- Price history ---
+        if not price_history:
+            for hf in HISTORY_FIELDS:
+                raw_hist = entry.get(hf)
+                raw_hist = _resolve(raw_hist, apollo)
+                # might be {house: [...]} or directly [...]
+                if isinstance(raw_hist, dict):
+                    raw_hist = (raw_hist.get("house") or raw_hist.get("houses")
+                                or raw_hist.get("residential") or [])
+                if not isinstance(raw_hist, list) or not raw_hist:
+                    continue
+                pts: list[dict] = []
+                for item in raw_hist:
+                    item = _resolve(item, apollo)
+                    if not isinstance(item, dict):
+                        continue
+                    yr = (item.get("year") or item.get("financialYear")
+                          or item.get("calendarYear") or item.get("period"))
+                    pr = (item.get("medianSalePrice") or item.get("soldMedianPrice")
+                          or item.get("medianPrice") or item.get("price")
+                          or item.get("median") or item.get("value"))
+                    if yr is None or pr is None:
+                        continue
+                    try:
+                        y_int = int(str(yr)[:4])
+                        p_int = _parse_price(pr)
+                    except (ValueError, TypeError):
+                        continue
+                    if p_int and 2015 <= y_int <= 2030:
+                        pts.append({"year": y_int, "median_house_price": p_int})
+                if len(pts) >= 2:
+                    seen: set = set()
+                    price_history = []
+                    for pt in sorted(pts, key=lambda x: x["year"]):
+                        if pt["year"] not in seen:
+                            seen.add(pt["year"])
+                            price_history.append(pt)
+                    price_history = price_history[-6:]
+                    break
 
-    # Deduplicate and sort, keep last 6
-    seen: set = set()
-    unique = []
-    for p in sorted(points, key=lambda x: x["year"]):
-        if p["year"] not in seen:
-            seen.add(p["year"])
-            unique.append(p)
-    return unique[-6:]
+    return median_house, median_unit, gross_yield, price_history, data_period
 
 
 async def scrape_domain_suburb_median(suburb: str, state: str, postcode: str) -> dict | None:
@@ -456,8 +566,10 @@ async def scrape_domain_suburb_median(suburb: str, state: str, postcode: str) ->
     Scrape domain.com.au/suburb-profile for median prices, gross rental yield,
     and year-by-year price history (last 6 years).
 
-    Returns a dict with coverage="available" using the same field names as the
-    VIC/NSW MCP sources. Returns None if fetch or parse fails.
+    Domain's suburb profile is a Next.js + Apollo Client app; all data lives
+    in pageProps.__APOLLO_STATE__ (normalized GraphQL cache).
+
+    Returns None if fetch or parse fails.
     """
     if not _SCRAPFLY_KEY:
         return None
@@ -475,75 +587,26 @@ async def scrape_domain_suburb_median(suburb: str, state: str, postcode: str) ->
         print(f"  Domain suburb profile: __NEXT_DATA__ not found for {suburb} {state}")
         return None
 
-    page_props = nd.get("props", {}).get("pageProps", {})
+    page_props  = nd.get("props", {}).get("pageProps", {})
+    apollo      = page_props.get("__APOLLO_STATE__") or {}
 
-    median_house  = None
-    median_unit   = None
-    gross_yield   = None
-    data_period   = None
-
-    # --- Path 1: suburbInsights.medians ---
-    si      = page_props.get("suburbInsights") or {}
-    medians = si.get("medians") or {}
-    for h_key in ("house", "houses"):
-        h = medians.get(h_key) or {}
-        p = h.get("medianSalePrice") or h.get("soldMedianPrice") or h.get("price")
-        if p:
-            median_house = p
-            gross_yield  = h.get("grossYield") or h.get("yield") or h.get("rentalYield")
-            data_period  = h.get("period") or si.get("dataPeriod") or si.get("period")
-            break
-    for u_key in ("unit", "units"):
-        u = medians.get(u_key) or {}
-        p = u.get("medianSalePrice") or u.get("soldMedianPrice") or u.get("price")
-        if p:
-            median_unit = p
-            break
-
-    # --- Path 2: componentProps sub-sections ---
-    if not median_house:
-        comp = page_props.get("componentProps") or {}
-        for section_key in ("suburbStatistics", "marketInsights", "statistics",
-                             "suburbProfile", "insights", "marketTrends"):
-            section = comp.get(section_key) or page_props.get(section_key) or {}
-            h = section.get("house") or section.get("houses") or {}
-            if not isinstance(h, dict):
-                h = section
-            p = (h.get("medianSalePrice") or h.get("soldMedianPrice")
-                 or h.get("medianPrice") or h.get("price"))
-            if p:
-                median_house = p
-                gross_yield  = h.get("grossYield") or h.get("yield") or h.get("rentalYield")
-                data_period  = section.get("period") or section.get("dataPeriod")
-                u = section.get("unit") or section.get("units") or {}
-                median_unit  = (u.get("medianSalePrice") or u.get("soldMedianPrice")
-                                or u.get("price"))
-                break
-
-    # --- Path 3: flat fields on pageProps ---
-    if not median_house:
-        for key in ("medianHousePrice", "houseMedSalePrice", "houseMedianPrice"):
-            if page_props.get(key):
-                median_house = page_props[key]
-                break
-    if not median_unit:
-        for key in ("medianUnitPrice", "unitMedSalePrice", "unitMedianPrice"):
-            if page_props.get(key):
-                median_unit = page_props[key]
-                break
-
-    if not median_house and not median_unit:
-        comp_keys = list((page_props.get("componentProps") or {}).keys())[:15]
-        print(
-            f"  Domain suburb profile: no median found for {suburb} {state}. "
-            f"pageProps keys={list(page_props.keys())[:15]} "
-            f"componentProps keys={comp_keys}"
-        )
+    if not apollo:
+        print(f"  Domain suburb profile: __APOLLO_STATE__ missing for {suburb} {state}. "
+              f"pageProps keys={list(page_props.keys())}")
         return None
 
-    hp            = _parse_price(median_house)
-    up            = _parse_price(median_unit) if median_unit else None
-    price_history = _extract_price_history(page_props)
+    median_house, median_unit, gross_yield, price_history, data_period = (
+        _parse_apollo_suburb_data(apollo)
+    )
+
+    if not median_house and not median_unit:
+        type_names = list({k.split(":")[0] for k in apollo if ":" in k})[:20]
+        print(f"  Domain suburb profile: no median found for {suburb} {state}. "
+              f"Apollo types={type_names}")
+        return None
+
+    hp = median_house
+    up = median_unit
 
     result: dict = {
         "suburb":      suburb,
@@ -555,14 +618,11 @@ async def scrape_domain_suburb_median(suburb: str, state: str, postcode: str) ->
     if hp:
         result["median_house_price"] = hp
     if up:
-        result["median_unit_price"] = up
+        result["median_unit_price"]  = up
     if gross_yield is not None:
-        try:
-            result["gross_rental_yield"] = float(gross_yield)
-        except (TypeError, ValueError):
-            pass
+        result["gross_rental_yield"] = gross_yield
     if price_history:
-        result["price_history_5yr"] = price_history
+        result["price_history_5yr"]  = price_history
 
     print(
         f"  Domain suburb profile: {suburb} {state} — "
@@ -573,13 +633,13 @@ async def scrape_domain_suburb_median(suburb: str, state: str, postcode: str) ->
 
 
 # ---------------------------------------------------------------------------
-# Debug helper — Domain suburb profile __NEXT_DATA__ structure
+# Debug helper — Domain suburb profile Apollo state structure
 # ---------------------------------------------------------------------------
 
 async def debug_domain_suburb_profile(suburb: str, state: str, postcode: str) -> dict:
     """
-    Diagnostic endpoint: fetch Domain suburb profile and return __NEXT_DATA__
-    structure summary so parser paths can be verified/fixed.
+    Diagnostic endpoint: fetch Domain suburb profile, dump __APOLLO_STATE__
+    type names and a sample of suburb-relevant entries for parser debugging.
     """
     suburb_slug = suburb.lower().replace(" ", "-")
     state_lower = state.lower()
@@ -591,32 +651,45 @@ async def debug_domain_suburb_profile(suburb: str, state: str, postcode: str) ->
 
     nd = _parse_domain_next_data(html)
     if not nd:
-        return {
-            "error": "__NEXT_DATA__ not found",
-            "url": url,
-            "html_length": len(html),
-            "html_preview": html[:500],
-        }
+        return {"error": "__NEXT_DATA__ not found", "url": url,
+                "html_preview": html[:500]}
 
     page_props = nd.get("props", {}).get("pageProps", {})
+    apollo     = page_props.get("__APOLLO_STATE__") or {}
 
-    def _summarise(obj, depth: int = 0):
-        if depth > 3:
-            return "…"
-        if isinstance(obj, dict):
-            return {k: _summarise(v, depth + 1) for k, v in list(obj.items())[:12]}
-        if isinstance(obj, list):
-            if not obj:
-                return []
-            first = _summarise(obj[0], depth + 1)
-            return [first, f"…({len(obj)} items)"] if len(obj) > 1 else [first]
-        return obj
+    # Group by type name
+    type_counts: dict[str, int] = {}
+    type_samples: dict[str, dict] = {}
+    for k, v in apollo.items():
+        t = k.split(":")[0] if ":" in k else k
+        type_counts[t] = type_counts.get(t, 0) + 1
+        # Keep one sample per type that looks suburb/price related
+        if t not in type_samples and isinstance(v, dict):
+            if any(term in k.lower() for term in
+                   ("suburb", "median", "price", "yield", "history", "profile",
+                    "stat", "insight", "market")):
+                type_samples[t] = {"_key": k, **{
+                    fk: fv for fk, fv in list(v.items())[:15]
+                    if not isinstance(fv, dict) or "__ref" not in fv
+                }}
+
+    median_house, median_unit, gross_yield, price_history, data_period = (
+        _parse_apollo_suburb_data(apollo)
+    )
 
     return {
-        "url":               url,
-        "page_props_keys":   list(page_props.keys()),
-        "page_props_summary": _summarise(page_props),
-        "price_history_attempt": _extract_price_history(page_props),
+        "url":             url,
+        "page_props_keys": list(page_props.keys()),
+        "apollo_type_counts": type_counts,
+        "apollo_relevant_samples": type_samples,
+        "parse_result": {
+            "median_house":  median_house,
+            "median_unit":   median_unit,
+            "gross_yield":   gross_yield,
+            "data_period":   data_period,
+            "history_points": len(price_history),
+            "price_history": price_history,
+        },
     }
 
 
