@@ -32,65 +32,45 @@ _SCRAPFLY_URL = "https://api.scrapfly.io/scrape"
 # ---------------------------------------------------------------------------
 
 async def _fetch(url: str) -> str | None:
-    """
-    Fetch via Scrapfly. Tries without ASP first (cheaper / avoids 422 on
-    restricted plans); retries with asp=true if the target page returns a
-    bot-detection status (403/503/429). Logs the full Scrapfly error body
-    on API-level failures so we can diagnose plan/credit issues.
-    """
+    """Fetch via Scrapfly with ASP bypass. Logs full error body on API failures."""
     if not _SCRAPFLY_KEY:
         return None
 
-    for attempt, use_asp in enumerate((False, True), start=1):
-        params: dict = {
-            "key":     _SCRAPFLY_KEY,
-            "url":     url,
-            "country": "au",
-        }
-        if use_asp:
-            params["asp"] = "true"
-
-        label = "asp" if use_asp else "no-asp"
-        try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                r = await client.get(_SCRAPFLY_URL, params=params)
-        except Exception as e:
-            raw = f"{type(e).__name__}: {str(e)}"
-            err = raw.replace(_SCRAPFLY_KEY, "scp-***") if _SCRAPFLY_KEY else raw
-            print(f"  Scrapfly network error ({label}, attempt {attempt}): {err} — {url[:80]}")
-            if not use_asp:
-                continue
-            return None
-
-        # Scrapfly API returned a non-200 HTTP status — log the body for diagnosis
-        if r.status_code != 200:
-            try:
-                body = r.json()
-                msg = (body.get("message") or body.get("error")
-                       or body.get("description") or json.dumps(body)[:300])
-            except Exception:
-                msg = r.text[:300]
-            msg = msg.replace(_SCRAPFLY_KEY, "scp-***") if _SCRAPFLY_KEY else msg
-            print(f"  Scrapfly {r.status_code} ({label}, attempt {attempt}): {msg} — {url[:80]}")
-            # 422 with ASP = plan restriction; 422 without ASP = retry with ASP
-            if not use_asp:
-                continue
-            return None
-
-        data   = r.json()
-        result = data.get("result", {})
-        sc     = result.get("status_code", 0)
-
-        if sc == 200:
-            print(f"  Scrapfly OK ({len(result.get('content', ''))} chars, {label}): {url[:80]}")
-            return result.get("content")
-
-        # Bot-detection from the target site — retry with ASP if we haven't yet
-        print(f"  Scrapfly target-status {sc} ({label}): {url[:80]}")
-        if sc in (403, 503, 429) and not use_asp:
-            continue
+    params = {
+        "key":     _SCRAPFLY_KEY,
+        "url":     url,
+        "asp":     "true",
+        "country": "au",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.get(_SCRAPFLY_URL, params=params)
+    except Exception as e:
+        raw = f"{type(e).__name__}: {str(e)}"
+        err = raw.replace(_SCRAPFLY_KEY, "scp-***") if _SCRAPFLY_KEY else raw
+        print(f"  Scrapfly network error: {err} — {url[:80]}")
         return None
 
+    # Scrapfly API-level error — log body for diagnosis
+    if r.status_code != 200:
+        try:
+            body = r.json()
+            msg  = (body.get("message") or body.get("error")
+                    or body.get("description") or json.dumps(body)[:300])
+        except Exception:
+            msg = r.text[:300]
+        msg = msg.replace(_SCRAPFLY_KEY, "scp-***") if _SCRAPFLY_KEY else msg
+        print(f"  Scrapfly {r.status_code}: {msg} — {url[:80]}")
+        return None
+
+    data   = r.json()
+    result = data.get("result", {})
+    sc     = result.get("status_code", 0)
+    if sc == 200:
+        print(f"  Scrapfly OK ({len(result.get('content', ''))} chars): {url[:80]}")
+        return result.get("content")
+
+    print(f"  Scrapfly target-status {sc}: {url[:80]}")
     return None
 
 
