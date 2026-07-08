@@ -396,6 +396,8 @@ def _parse_apollo_suburb_data(apollo: dict) -> tuple:
     PRICE_PRICE_FIELDS = (
         "medianSalePrice", "soldMedianPrice", "medianPrice",
         "median", "price", "value",
+        "medianHousePrice", "houseMedianPrice", "medianListingPrice",
+        "currentMedianPrice", "twelveMonthMedianPrice",
     )
     YIELD_FIELDS = (
         "grossYield", "rentalYield", "yield", "grossRentalYield", "rentalReturn",
@@ -474,12 +476,18 @@ def _parse_apollo_suburb_data(apollo: dict) -> tuple:
 
         # Also check nested house/unit sub-objects
         for sub_key, sub_label, store_house in (
-            ("house",       "house",  True),
-            ("houses",      "house",  True),
-            ("residential", "house",  True),
-            ("unit",        "unit",   False),
-            ("units",       "unit",   False),
-            ("apartment",   "unit",   False),
+            ("house",           "house",  True),
+            ("houses",          "house",  True),
+            ("residential",     "house",  True),
+            ("houseStatistics", "house",  True),
+            ("houseStats",      "house",  True),
+            ("houseData",       "house",  True),
+            ("unit",            "unit",   False),
+            ("units",           "unit",   False),
+            ("apartment",       "unit",   False),
+            ("unitStatistics",  "unit",   False),
+            ("unitStats",       "unit",   False),
+            ("unitData",        "unit",   False),
         ):
             sub = entry.get(sub_key)
             sub = _resolve(sub, apollo)
@@ -557,6 +565,26 @@ def _parse_apollo_suburb_data(apollo: dict) -> tuple:
                             price_history.append(pt)
                     price_history = price_history[-6:]
                     break
+
+    # Second pass: scan every field NAME across all entries for house/unit price signals.
+    # Catches patterns like medianHousePrice, houseMedianPrice, unitMedian, etc.
+    # that live directly on LocationProfile, Suburb, or any other type.
+    if not median_house or not median_unit:
+        for cache_key, entry in apollo.items():
+            if not isinstance(entry, dict):
+                continue
+            for field, raw_val in entry.items():
+                resolved = _resolve(raw_val, apollo)
+                p = _parse_price(resolved)
+                if not p or not (_AU_PRICE_MIN <= p <= _AU_PRICE_MAX):
+                    continue
+                fl = field.lower()
+                if "house" in fl or "residential" in fl or "dwelling" in fl:
+                    if median_house is None:
+                        median_house = p
+                elif "unit" in fl or "apartment" in fl or "flat" in fl:
+                    if median_unit is None:
+                        median_unit = p
 
     return median_house, median_unit, gross_yield, price_history, data_period
 
