@@ -31,7 +31,7 @@ _SCRAPFLY_URL = "https://api.scrapfly.io/scrape"
 # Fetch
 # ---------------------------------------------------------------------------
 
-async def _fetch(url: str) -> str | None:
+async def _fetch(url: str, render_js: bool = False) -> str | None:
     """Fetch via Scrapfly with ASP bypass. Logs full error body on API failures."""
     if not _SCRAPFLY_KEY:
         return None
@@ -42,6 +42,8 @@ async def _fetch(url: str) -> str | None:
         "asp":     "true",
         "country": "au",
     }
+    if render_js:
+        params["render_js"] = "true"
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             r = await client.get(_SCRAPFLY_URL, params=params)
@@ -606,7 +608,12 @@ async def scrape_domain_suburb_median(suburb: str, state: str, postcode: str) ->
     state_lower = state.lower()
     url = f"https://www.domain.com.au/suburb-profile/{suburb_slug}-{state_lower}-{postcode}"
 
-    html = await _fetch(url)
+    # Suburb profile median stats are loaded client-side — render_js is required.
+    # On 422 (proxy blocked by Domain CDN), retry once without render_js as fallback.
+    html = await _fetch(url, render_js=True)
+    if not html:
+        print(f"  Domain suburb profile: render_js fetch failed, retrying without JS — {url}")
+        html = await _fetch(url, render_js=False)
     if not html:
         return None
 
